@@ -588,6 +588,16 @@ public sealed partial class CoreService : IDisposable
         configJson = RefreshTunAdapterName(configJson);
 
         AppPaths.EnsureCreated();
+
+        // TUN-режим: снимаем остаточный wintun-адаптер прошлого сеанса (после Kill ядро
+        // не успевает его удалить, и следующий старт падает с FATAL «adapter already exists»).
+        if (TunCleanup.ConfigHasTun(configJson))
+        {
+            var cleanupError = TunCleanup.PrepareForTun();
+            if (cleanupError is not null)
+                AppendLog("Очистка TUN-адаптера: " + cleanupError);
+        }
+
         await File.WriteAllTextAsync(AppPaths.RuntimeConfig, configJson, new UTF8Encoding(false));
         _clashPort = clashPort;
 
@@ -910,6 +920,43 @@ public sealed partial class CoreService : IDisposable
     /// без таймаута, а их может держать живой потомок ядра, и тогда ожидание не заканчивается.
     /// Событие Exited подписываем до проверки HasExited, чтобы не пропустить выход процесса.
     /// </summary>
+    /// <summary>
+    /// Мягкая остановка sing-box через Ctrl+C: ядро успевает снять маршруты и удалить
+    /// wintun-адаптер само. Без этого после Kill адаптер остаётся, и следующий старт
+    /// падает с «create adapter: file already exists».
+    /// </summary>
+    private static async Task<bool> TryGracefulShutdownAsync(Process process, TimeSpan timeout)
+    {
+        try
+        {
+            FreeConsole();
+            if (!AttachConsole((uint)process.Id)) return false;
+            try
+            {
+                // игнорируем Ctrl+C в своей консоли, пока шлём его ядру
+                SetConsoleCtrlHandler(null, true);
+                if (!GenerateConsoleCtrlEvent(CtrlCEvent, 0)) return false;
+                var wait = process.WaitForExitAsync();
+                return await Task.WhenAny(wait, Task.Delay(timeout)) == wait;
+            }
+            finally
+            {
+                FreeConsole();
+            }
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private delegate bool ConsoleCtrlHandlerRoutine(uint ctrlType);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern bool FreeConsole();
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern bool AttachConsole(uint dwProcessId);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandlerRoutine? handler, bool add);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
+    private const uint CtrlCEvent = 0;
+
     private async Task KillProcessAsync(Process process, TimeSpan timeout)
     {
         var exited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -919,17 +966,21 @@ public sealed partial class CoreService : IDisposable
             process.Exited += onExited;   // EnableRaisingEvents включён при создании процесса
             if (!process.HasExited)
             {
-                try
+                // Сначала мягкая остановка (Ctrl+C), по таймауту — Kill как раньше.
+                if (!await TryGracefulShutdownAsync(process, TimeSpan.FromSeconds(4)))
                 {
-                    process.Kill(entireProcessTree: true);
-                }
-                catch (Exception ex)
-                {
-                    AppendLog("Не удалось завершить процесс ядра: " + FirstLine(ex.Message));
-                }
+                    try
+                    {
+                        process.Kill(entireProcessTree: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendLog("Не удалось завершить процесс ядра: " + FirstLine(ex.Message));
+                    }
 
-                if (!process.HasExited)
-                    await Task.WhenAny(exited.Task, Task.Delay(timeout));
+                    if (!process.HasExited)
+                        await Task.WhenAny(exited.Task, Task.Delay(timeout));
+                }
             }
 
             if (!process.HasExited)
