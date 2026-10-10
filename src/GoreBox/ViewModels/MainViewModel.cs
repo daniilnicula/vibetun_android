@@ -595,9 +595,12 @@ public sealed class MainViewModel : ObservableObject
                 return;
             }
 
-            // системный прокси забирает себе ядро (если обход DPI уже владеет им — он его и оставит)
+            // системный прокси забирает себе ядро (если обход DPI уже владеет им — он его и оставит).
+            // При включённом TUN системный прокси не ставим: туннель и так захватывает весь трафик,
+            // а прокси на 127.0.0.1 ломает UWP/WebView2-приложения (Яндекс Музыка и т.п.) —
+            // для них loopback заблокирован изоляцией AppContainer, приложение видит «нет сети».
             _dpiOwnsSystemProxy = false;
-            if (route.UseSystemProxy) SystemProxy.CaptureSnapshot();
+            if (route.UseSystemProxy && !route.TunEnabled) SystemProxy.CaptureSnapshot();
 
             ShowStatus("Запуск ядра…", false);
             await Core.StartAsync(build.Json, clashPort);
@@ -874,7 +877,9 @@ public sealed class MainViewModel : ObservableObject
                      App.Settings.Current.Dpi.UseSystemProxy && dpiPort > 0;
 
         var route = Routing.ActiveProfile;
-        var useProxy = !useDpi && IsProxyOn && route.UseSystemProxy;
+        // TUN сам захватывает весь трафик — системный прокси не нужен и вреден
+        // (ломает UWP/WebView2-приложения из-за loopback-изоляции AppContainer).
+        var useProxy = !useDpi && IsProxyOn && route.UseSystemProxy && !route.TunEnabled;
 
         var host = useDpi ? "127.0.0.1" : route.ListenAddress.Trim();
         if (host.Length == 0 || host is "0.0.0.0" or "::" or "[::]" or "*") host = "127.0.0.1";
