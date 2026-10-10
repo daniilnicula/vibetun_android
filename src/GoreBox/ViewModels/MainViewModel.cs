@@ -62,6 +62,7 @@ public sealed class MainViewModel : ObservableObject
         Profiles.Notify += (text, error) => ShowStatus(text, error);
         Routing.Notify += (text, error) => ShowStatus(text, error);
         Routing.SettingsChanged += () => { /* маршрутизация перечитывается при следующем запуске */ };
+        Routing.RulesPersisted += () => _ = ReapplyRoutingAsync();
         Preferences.Notify += (text, error) => ShowStatus(text, error);
         Preferences.ThemeChanged += () => Raise(nameof(IsDark));
         Preferences.RestartRequested += () => RestartRequested?.Invoke();
@@ -471,6 +472,34 @@ public sealed class MainViewModel : ObservableObject
         if (IsProxyOn) await StopProxyAsync();
         else await StartProxyAsync();
     }
+
+    /// <summary>
+    /// Наборы правил/приложений сохранены: если прокси активен, переподключаем ядро,
+    /// чтобы маршруты вступили в силу сразу. Раньше изменения ждали ручного
+    /// переподключения — из-за этого правило «DIRECT» для приложения не работало,
+    /// пока пользователь не передёрнул подключение.
+    /// </summary>
+    private async Task ReapplyRoutingAsync()
+    {
+        if (!IsProxyOn || _activeProfile is null || Busy) return;
+
+        // дребезг: переподключение одно на серию правок (тоглы, удаления и т.п.)
+        _routingReapplyCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _routingReapplyCts = cts;
+        try
+        {
+            await Task.Delay(1200, cts.Token);
+            if (cts.IsCancellationRequested) return;
+
+            ShowStatus("Маршруты изменены — переподключение…", false);
+            await StopProxyAsync();
+            await StartProxyAsync();
+        }
+        catch (OperationCanceledException) { /* пришла новая правка — переподключимся по ней */ }
+    }
+
+    private CancellationTokenSource? _routingReapplyCts;
 
     private async Task ConnectToAsync(ProxyProfile profile)
     {

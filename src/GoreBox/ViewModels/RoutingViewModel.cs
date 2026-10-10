@@ -30,6 +30,7 @@ public sealed class RoutingViewModel : ObservableObject
         {
             _saveTimer.Stop();
             Persist();
+            RulesPersisted?.Invoke();
         };
 
         AddRuleCommand = new RelayCommand(_ => AddRule(), _ => !string.IsNullOrWhiteSpace(NewRulePattern));
@@ -55,6 +56,9 @@ public sealed class RoutingViewModel : ObservableObject
 
     public event Action<string, bool>? Notify;
     public event Action? SettingsChanged;
+    /// <summary>Наборы правил/приложений сохранены на диск. Подписчик (MainViewModel)
+    /// переподключает ядро, если прокси активен, — чтобы правила вступили в силу сразу.</summary>
+    public event Action? RulesPersisted;
 
     public RelayCommand AddRuleCommand { get; }
     public RelayCommand RemoveRuleCommand { get; }
