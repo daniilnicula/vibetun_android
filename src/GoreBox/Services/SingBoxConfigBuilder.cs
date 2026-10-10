@@ -1023,13 +1023,16 @@ public static class SingBoxConfigBuilder
                        ?? new List<AppRule>();
         foreach (var app in appRules)
         {
-            var obj = new JsonObject();
+            // Поля одного правила в sing-box объединяются по И: если и process_name, и process_path
+            // лежат в одном объекте, правило умрёт при первом же обновлении программы (путь
+            // содержит версию, напр. WindowsApps\..._4.54.8517.0_x64__...). Разбиваем на два
+            // отдельных правила — матчит хоть имя процесса, хоть путь.
             if (!string.IsNullOrWhiteSpace(app.ProcessName))
-                obj["process_name"] = new JsonArray(NormalizeProcessName(app.ProcessName));
+                rules.Add(Action(modern, app.Action,
+                    new JsonObject { ["process_name"] = new JsonArray(NormalizeProcessName(app.ProcessName)) }));
             var path = app.Path;
             if (allowProcessPath && !string.IsNullOrWhiteSpace(path))
-                obj["process_path"] = new JsonArray(path);
-            rules.Add(Action(modern, app.Action, obj));
+                rules.Add(Action(modern, app.Action, new JsonObject { ["process_path"] = new JsonArray(path) }));
         }
 
         var routeNode = new JsonObject
