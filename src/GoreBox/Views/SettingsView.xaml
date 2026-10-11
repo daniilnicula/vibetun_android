@@ -39,11 +39,6 @@
                         </Grid>
 
                         <Grid Margin="0,14,0,0">
-                            <TextBlock Text="Закрывать окно в трей" Style="{StaticResource Txt}" VerticalAlignment="Center" />
-                            <ToggleButton Style="{StaticResource Switch}" HorizontalAlignment="Right" IsChecked="{Binding CloseToTray}" />
-                        </Grid>
-
-                        <Grid Margin="0,14,0,0">
                             <TextBlock Text="Запоминать состояние при выходе" Style="{StaticResource Txt}" VerticalAlignment="Center" />
                             <ToggleButton Style="{StaticResource Switch}" HorizontalAlignment="Right" IsChecked="{Binding RememberState}" />
                         </Grid>
@@ -56,6 +51,20 @@
                         </Grid>
                         <TextBlock Style="{StaticResource TxtMuted}" TextWrapping="Wrap" Margin="0,6,0,0"
                                    Text="Использует API ядра для реального времени ответа сервера. Без ядра измеряется TCP/ICMP." />
+
+                        <Border Height="1" Background="{DynamicResource Divider}" Margin="0,14" />
+
+                        <Grid>
+                            <TextBlock Text="При закрытии окна" Style="{StaticResource Txt}" VerticalAlignment="Center" />
+                            <ComboBox Style="{StaticResource Combo}" Width="230" HorizontalAlignment="Right"
+                                      SelectedValuePath="Tag" SelectedValue="{Binding CloseBehavior}">
+                                <ComboBoxItem Tag="Ask" Content="Спрашивать" />
+                                <ComboBoxItem Tag="HideToTray" Content="Сворачивать в трей" />
+                                <ComboBoxItem Tag="Exit" Content="Закрывать полностью" />
+                            </ComboBox>
+                        </Grid>
+                        <TextBlock Style="{StaticResource TxtMuted}" TextWrapping="Wrap" Margin="0,6,0,0"
+                                   Text="«Спрашивать» — при нажатии на крестик покажет выбор: скрыть в трей или выйти из приложения." />
                     </StackPanel>
                 </Border>
 

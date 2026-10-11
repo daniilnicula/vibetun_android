@@ -595,7 +595,22 @@ public partial class MainWindow : Window
 
     private void OnCloseClick(object sender, RoutedEventArgs e)
     {
-        if (App.Settings.Current.CloseToTray) HideToTray();
+        switch (App.Settings.Current.CloseBehavior)
+        {
+            case CloseBehavior.HideToTray: HideToTray(); return;
+            case CloseBehavior.Exit: ExitApplication(); return;
+        }
+
+        // Спрашиваем: скрыть в трей или выйти из приложения.
+        var dialog = new Dialogs.CloseDialogWindow { Owner = this };
+        var result = dialog.ShowDialog();
+        if (result is null) return;   // Esc — остаёмся в приложении
+        if (dialog.RememberMyChoice)
+        {
+            App.Settings.Current.CloseBehavior = result == true ? CloseBehavior.HideToTray : CloseBehavior.Exit;
+            App.Settings.SaveSoon();
+        }
+        if (result == true) HideToTray();
         else ExitApplication();
     }
 
@@ -654,8 +669,12 @@ public partial class MainWindow : Window
             return;
         }
 
-        // закрытие окна = сворачивание в трей (настройка включена по умолчанию)
-        if (App.Settings.Current.CloseToTray)
+        // поведение при закрытии: свернуть в трей, выйти или спросить.
+        // Из OnClosing (Alt+F4, системные закрытия) диалог не показываем — сворачиваем в трей,
+        // выбор «скрыть/выйти» есть у кнопки-крестика.
+        var behavior = App.Settings.Current.CloseBehavior;
+        if (behavior == CloseBehavior.Ask) behavior = CloseBehavior.HideToTray;
+        if (behavior == CloseBehavior.HideToTray)
         {
             e.Cancel = true;
             HideToTray();

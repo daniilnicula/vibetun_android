@@ -92,38 +92,28 @@ public partial class SshPage : UserControl
         _entry.Port = port;
 
         var owner = Window.GetWindow(this) ?? Application.Current.MainWindow;
-        var dialogs = new DialogService(owner!);
 
-        // логин свой для записи (шестерёнка в списке), важнее user@ из адреса;
-        // иначе берём из адреса или спрашиваем — и запоминаем за записью
+        // логин свой для записи (шестерёнка в списке), важнее user@ из адреса.
         var storedLogin = _entry.User?.Trim() ?? "";
         if (storedLogin.Length > 0)
         {
             user = storedLogin;
         }
-        else if (user.Length == 0)
-        {
-            var entered = dialogs.PromptText("SSH", "Имя пользователя для " + host, "");
-            if (string.IsNullOrWhiteSpace(entered))
-            {
-                Write("Подключение отменено: нет имени пользователя.", GetBrush("Warning"));
-                return;
-            }
-            user = entered.Trim();
-            _entry.User = user;   // спросили — запоминаем за записью
-        }
 
-        // пароль свой для записи; иначе спросим и запомним за записью
-        var password = _entry.Password;
-        if (string.IsNullOrEmpty(password))
+        // пароль свой для записи. Если логина или пароля нет — показываем окно с тем, что
+        // известно: логин и пароль подставляются и редактируются разом, сохраняем за записью.
+        var password = _entry.Password ?? "";
+        if (user.Length == 0 || password.Length == 0)
         {
-            var entered = dialogs.PromptText("SSH", $"Пароль для {user}@{host}", "");
-            if (entered is null)
+            var window = new Dialogs.SshCredentialsWindow($"SSH — {host}", user, password) { Owner = owner };
+            if (window.ShowDialog() != true)
             {
-                Write("Подключение отменено: нет пароля.", GetBrush("Warning"));
+                Write("Подключение отменено: нет логина или пароля.", GetBrush("Warning"));
                 return;
             }
-            password = entered;
+            user = window.User;
+            password = window.Password;
+            _entry.User = user;
             _entry.Password = password;
         }
         App.Settings.SaveSoon();

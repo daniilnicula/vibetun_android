@@ -36,6 +36,23 @@ public partial class SshCredentialsWindow : Window
         Close();
     }
 
+    private void OnCopyUser(object sender, RoutedEventArgs e)
+        => CopyToClipboard(UserBox.Text?.Trim() ?? "");
+
+    private void OnCopyPassword(object sender, RoutedEventArgs e)
+        => CopyToClipboard(PwdBox.Password ?? "");
+
+    private void CopyToClipboard(string value)
+    {
+        if (value.Length == 0) return;
+        Clipboard.SetText(value);
+        // короткая подсветка-подтверждение, без всплывающих окон
+        CopiedHint.Opacity = 1;
+        var timer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(1.2) };
+        timer.Tick += (_, _) => { timer.Stop(); CopiedHint.Opacity = 0; };
+        timer.Start();
+    }
+
     private void OnCancel(object sender, RoutedEventArgs e)
     {
         DialogResult = false;

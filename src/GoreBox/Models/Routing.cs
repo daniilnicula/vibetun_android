@@ -2,6 +2,17 @@ using System.Text.Json.Serialization;
 
 namespace GoreBox.Models;
 
+/// <summary>Что делать при закрытии окна по кнопке-крестику.</summary>
+public enum CloseBehavior
+{
+    /// <summary>Спрашивать: скрыть в трей или выйти из приложения.</summary>
+    Ask,
+    /// <summary>Всегда сворачивать в трей.</summary>
+    HideToTray,
+    /// <summary>Всегда закрывать приложение полностью.</summary>
+    Exit,
+}
+
 /// <summary>Правило маршрутизации для доменов/адресов.</summary>
 public sealed class RouteRule
 {
@@ -177,7 +188,9 @@ public sealed class AppSettings
 
     public bool RunAtStartup { get; set; }
     public bool StartMinimized { get; set; }
-    public bool CloseToTray { get; set; } = true;
+
+    /// <summary>Что делать при закрытии окна по крестику.</summary>
+    public CloseBehavior CloseBehavior { get; set; } = CloseBehavior.Ask;
     public bool TrayHintShown { get; set; }
 
     /// <summary>Путь к выбранному ядру (sing-box). Пусто — используется скачанное приложением.</summary>

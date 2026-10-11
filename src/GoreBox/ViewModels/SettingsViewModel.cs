@@ -107,13 +107,13 @@ public sealed class SettingsViewModel : ObservableObject
         }
     }
 
-    public bool CloseToTray
+    public CloseBehavior CloseBehavior
     {
-        get => _settings.Current.CloseToTray;
+        get => _settings.Current.CloseBehavior;
         set
         {
-            if (_settings.Current.CloseToTray == value) return;
-            _settings.Current.CloseToTray = value;
+            if (_settings.Current.CloseBehavior == value) return;
+            _settings.Current.CloseBehavior = value;
             _settings.SaveSoon();
             Raise();
         }
