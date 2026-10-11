@@ -1,3 +1,14 @@
-bin/
-obj/
-dist/
+# Android / Gradle
+.gradle/
+local.properties
+.idea/
+*.iml
+**/build/
+*.apk
+*.aab
+*.ap_
+
+# Native Android core generated from gomobile
+app/libs/libbox.aar
+app/libs/libbox-*.aar
+app/src/main/jniLibs/

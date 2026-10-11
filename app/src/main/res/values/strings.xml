@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">GoreBox</string>
+    <string name="quick_tile_name">GoreBox Proxy</string>
+    <string name="notification_channel_name">GoreBox connection</string>
+    <string name="notification_channel_description">Status of the GoreBox proxy connection</string>
+    <string name="notification_title">GoreBox is active</string>
+</resources>

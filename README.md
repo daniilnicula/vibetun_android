@@ -1,50 +1,53 @@
-# GoreBox
+# GoreBox Android
 
-proxy/VPN-клиент на C# (.NET 8, WPF): обвязка над ядром **nekobox_core**
-(sing-box из исходников nekoray, vendored в `core/`).
-## Протоколы
-Профили: `vmess`, `vless`, `trojan`, `shadowsocks`, `socks`, `http`, `hysteria2`,
-`hysteria`, `tuic`, `anytls`, `ssh`, `wireguard`, `amneziawg`, `mtproto`, `tunnel` (custom JSON).
-<img width="1034" height="715" alt="image" src="https://github.com/user-attachments/assets/2e8b6b3b-635b-4c85-b780-008bfeb9b06b" />
-<img width="1701" height="716" alt="image" src="https://github.com/user-attachments/assets/584fa00e-61ec-4b7d-b474-57e8104545d4" />
+Android-клиент GoreBox с интерфейсом в палитре и визуальном стиле Windows-версии: [GoreSense/GoreBox · Windows](https://github.com/GoreSense/GoreBox/tree/Windows). Приложение использует тот же sing-box-код из дерева Windows-версии, собранный в Android `libbox.aar`, и Android `VpnService`/TUN для маршрутизации трафика.
 
+## Реализация
 
+- Kotlin + Jetpack Compose, локальное хранение профилей, импорт ссылок и JSON, экран маршрутов, светлая/тёмная тема.
+- sing-box `1.9.7-neko-1` собирается через gomobile для Android; исходники ядра лежат в `core/sing-box/` и `core/sing-quic/`. AmneziaWG запускается отдельным встроенным userspace-движком `amneziawg-go` через тот же Android `VpnService`.
+- `GoreBoxVpnService` реализует `PlatformInterface`: создаёт TUN через `VpnService.Builder`, защищает исходящие сокеты через `VpnService.protect()`, следит за сменой сети и передаёт lifecycle ядру. Для TUN используется gVisor-stack, чтобы не привязывать системные сокеты Android к виртуальному IPv6-адресу.
+- Режим выбранных приложений использует `include_package` sing-box и `Builder.addAllowedApplication()`. Сам GoreBox исключается из списка VPN-приложений, чтобы служба могла устанавливать прокси-соединения.
+- Quick Settings-плитка GoreBox: короткое нажатие переключает VPN; если ещё нет профиля или разрешения Android, открывает приложение для настройки. Удержание плитки открывает GoreBox.
+- При первом запуске пользователь получает рекомендацию снять ограничения батареи. Приложение не меняет системные настройки без разрешения пользователя.
+- Профили и учётные данные хранятся локально в приватном хранилище приложения.
 
-| Протокол | Реализация |
-|---|---|
-| vmess / vless / trojan / shadowsocks / http | outbounds ядра sing-box (сборка без extra-тегов) |
-| wireguard | outbounds (старые ядра) или `endpoints` (≥1.11); MTU clamp, auto_route/strict_route в TUN |
-| hysteria / hysteria2 / tuic | тег `with_quic` (vendored sing-quic) |
-| mixed | inbound mixed — режим прослушки по умолчанию (Socks+Http) |
-| tunnel | профиль Custom: JSON ядра пользователя идёт в ядро как есть (ветка RawJson в SingBoxConfigBuilder) |
-| tun | режим TUN (маршрут по умолчанию, stack/gvisor из тегов сборки) |
-| mtproto | применяется только внутри Telegram (ядро sing-box MTProto-outbound не имеет ни в одной ветке) — профиль открывается через `tg://` |
-| amneziawg | расширенные сборки ядра (sing-box-extended, sing-box-lx и т.п.); базовая сборка отклоняет профиль с подсказкой |
+## Поддержка профилей
 
-Со стороны UI список протоколов — `ProfileEditorViewModel.ProtocolList`, конвертация в JSON
-ядра — `Services/SingBoxConfigBuilder.cs`, импорт ссылок/подписок/JSON — `Utils/LinkParser.cs`
-и `Utils/JsonConfigConverter.cs`.
+Связка Android-конвертера и текущей версии ядра подключает:
 
-## Архитектура: gRPC поверх nekobox_core
+- VLESS (TLS/Reality, WebSocket, gRPC, HTTP/HTTPUpgrade);
+- VMess;
+- Trojan;
+- Shadowsocks;
+- SOCKS4/5;
+- HTTP/HTTPS;
+- Hysteria и Hysteria 2;
+- TUIC;
+- WireGuard (ссылки и стандартные конфиги `.conf`);
+- AmneziaWG 1.x/2.x/3.x `.conf` с параметрами обфускации Jc/Jmin/Jmax, S1–S4, H1–H4, I1–I5 и дополнительными настройками AmneziaWG 3.x;
+- SSH (аутентификация по паролю);
+- полный sing-box JSON (если содержит валидный `outbounds`; при необходимости GoreBox добавляет TUN inbound).
 
-`nekobox_core` — один бинарник с двумя режимами (см. `core/README.md`):
+Импортёр может сохранить и другие форматы Windows-версии, но приложение **не запускает заведомо неподдерживаемые профили**: AnyTLS отсутствует в vendored sing-box `1.9.7-neko-1`, ShadowsocksR не реализован в ядре, а MTProto рассчитан на Telegram и не является общим TUN-протоколом. Для них при подключении показывается причина отказа.
 
-1. **gRPC (основной для GoreBox):** `sing-box.exe nekobox --token T --port P` поднимает
-   libcore-сервис на 127.0.0.1; приложение шлёт `Start` (конфиг-JSON), `Stop`, `Test`,
-   `QueryStats` с заголовком `nekoray_auth` (ровно одно значение). Клиент —
-   `src/GoreBox/Services/NekoCoreRpcClient.cs`, протокол — `src/GoreBox/Protos/libcore.proto`
-   (зеркало `core/nekoray/go/grpc_server/gen/libcore.proto`; генерация стабов — Grpc.Tools).
-2. **Fallback `run -c`:** если ядро без баннера `NekoBox:` (скачанный релиз, форк) или
-   gRPC-путь по любой причине не поднялся, `CoreService.StartAsync` автоматически запускает
-   тот же бинарник обычным `run -c … -D run\` — контракт с UI не меняется.
+## Собрать APK
 
-Статистика трафика и задержка идут через clash API из конфига (он поднимается внутри
-инстанса в обоих режимах); `QueryStats` gRPC доступен как альтернатива.
+Нужны JDK 17, Android SDK API 35 и Android NDK `26.2.11394342`. Сборка AWG-runtime требует Go 1.25.x, а gomobile-ядро sing-box закреплено на Go 1.23.x. Сначала соберите нативную библиотеку AmneziaWG с Go 1.25.x, затем переключите `PATH` на Go 1.23.x для libbox и соберите приложение:
 
-## Хранение данных
-Профили, наборы правил, настройки, ядро, логи и профиль браузера «Панели» лежат в одной папке.
-По умолчанию это папка `data` рядом с `GoreBox.exe`. Место выбирается в «Настройках» → «Данные приложения»:
-«В локальной папке» (`%LocalAppData%\GoreBox`), «Рядом с исполняемым файлом» или «Указать своё место».
-Выбор запоминается в `%LocalAppData%\GoreBox\location.json` и вступает в силу после перезапуска.
-Если в новой папке данных ещё нет, данные из прежней копируются при запуске; существующие файлы не перезаписываются.
-Если папка рядом с exe недоступна для записи (например, в `Program Files`), используется локальная папка и приложение об этом сообщает.
+```bash
+./scripts/build-amneziawg-android.sh
+./scripts/build-libbox-android.sh
+./gradlew testDebugUnitTest assembleDebug
+```
+
+Debug APK появится в `app/build/outputs/apk/debug/app-debug.apk`. Скрипт устанавливает `gomobile`/`gobind` из Go-модуля; Android SDK и NDK должны быть установлены и лицензии приняты. Полученный `app/libs/libbox.aar` игнорируется Git — в репозитории находятся исходники и воспроизводимая сборка, а не локальный бинарный артефакт.
+
+GitHub Actions workflow `.github/workflows/android.yml` собирает ядро, запускает unit-тесты и публикует APK как artifact `GoreBox-debug-apk`. Для этой рабочей ветки workflow также помещает сжатый установочный файл `deliverables/GoreBox-debug-apk.zip` (debug-подпись) в ветку; распакуйте архив, чтобы получить `GoreBox-debug.apk`.
+
+## Важные ограничения Android
+
+- Per-app proxy реализован посредством `VpnService`/TUN. В Android нет публичного системного API для назначения обычного HTTP/SOCKS proxy произвольным приложениям по отдельности.
+- Для запуска нужно один раз подтвердить системный запрос VPN. Сеть, DNS, профиль, серверная доступность, ограничения прошивки и выбранные приложения влияют на фактическое подключение.
+- Android/Go-сборка и unit-тесты проверяют интеграцию и преобразование профилей; перед выпуском на широкую аудиторию APK следует проверить на реальных устройствах и серверах для каждого протокола. Сборка сама по себе не заменяет такое end-to-end тестирование.
+- Долговременная работа в фоне зависит от разрешений Android и политики производителя. На отдельных прошивках вручную включите автозапуск или режим батареи «Без ограничений».
