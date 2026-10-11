@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "arena/03ebb552-goreboxandroid"
+      - "android-features"
   workflow_dispatch:
 
 permissions:
