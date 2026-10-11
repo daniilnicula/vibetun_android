@@ -28,6 +28,10 @@ class GoreBoxViewModel(application: Application) : AndroidViewModel(application)
         private set
     var selectedPackages by mutableStateOf(store.selectedAppPackages)
         private set
+    var directPackages by mutableStateOf(store.directAppPackages)
+        private set
+    var launchAtBoot by mutableStateOf(store.launchAtBoot)
+        private set
     var installedApps by mutableStateOf<List<InstalledApp>>(emptyList())
         private set
     var connectionState by mutableStateOf(connectionStore.state)
@@ -41,6 +45,21 @@ class GoreBoxViewModel(application: Application) : AndroidViewModel(application)
         private set
     var searchQuery by mutableStateOf("")
 
+    /** Профили, по которым сейчас идёт замер задержки. */
+    var pingingIds by mutableStateOf(setOf<String>())
+        private set
+    var pingingAll by mutableStateOf(false)
+        private set
+
+    /** Наборы правил маршрутизации (отдельные json-файлы, как routes\ в Windows). */
+    var routeSetNames by mutableStateOf(listOf<String>())
+        private set
+    var activeRouteSet by mutableStateOf("")
+        private set
+    var routeRules by mutableStateOf(listOf<RouteRule>())
+        private set
+    private val routeSetStore = RouteSetStore(application)
+
     private var appsLoaded = false
 
     init {
@@ -49,6 +68,7 @@ class GoreBoxViewModel(application: Application) : AndroidViewModel(application)
             selectedProfileId = profiles.firstOrNull()?.id.orEmpty()
             store.selectedProfileId = selectedProfileId
         }
+        refreshRouteSets()
         refreshConnectionState()
     }
 
@@ -140,6 +160,11 @@ class GoreBoxViewModel(application: Application) : AndroidViewModel(application)
         if (!mutable.add(packageName)) mutable.remove(packageName)
         selectedPackages = mutable
         store.selectedAppPackages = mutable
+        // приложение в туннеле больше не может быть direct
+        if (packageName in mutable && packageName in directPackages) {
+            directPackages = directPackages - packageName
+            store.directAppPackages = directPackages
+        }
     }
 
     fun loadInstalledApps() {
@@ -204,6 +229,128 @@ class GoreBoxViewModel(application: Application) : AndroidViewModel(application)
 
     fun clearFeedback() {
         feedback = null
+    }
+
+    /** Замер задержки профиля: 3 попытки TCP-подключения, в список уходит лучшее значение. */
+    fun pingProfile(profileId: String) {
+        val profile = profiles.firstOrNull { it.id == profileId } ?: return
+        if (profileId in pingingIds) return
+        pingingIds = pingingIds + profileId
+        viewModelScope.launch {
+            val latency = withContext(Dispatchers.IO) { LatencyTester.ping(profile) }
+            pingingIds = pingingIds - profileId
+            val index = profiles.indexOfFirst { it.id == profileId }
+            if (index >= 0) profiles[index] = profiles[index].copy(latencyMs = latency)
+            persistProfiles()
+        }
+    }
+
+    /** Замер всех профилей сразу; «нет ответа» сохраняется как пустое значение. */
+    fun pingAll() {
+        if (pingingAll) return
+        val targets = profiles.toList()
+        if (targets.isEmpty()) {
+            feedback = "Сначала добавьте профили."
+            return
+        }
+        pingingAll = true
+        pingingIds = targets.map { it.id }.toSet()
+        viewModelScope.launch {
+            val results = withContext(Dispatchers.IO) {
+                targets.associate { it.id to LatencyTester.ping(it) }
+            }
+            pingingIds = emptySet()
+            pingingAll = false
+            targets.forEach { profile ->
+                val index = profiles.indexOfFirst { it.id == profile.id }
+                if (index >= 0) profiles[index] = profiles[index].copy(latencyMs = results[profile.id])
+            }
+            persistProfiles()
+            val reachable = results.values.count { it != null }
+            feedback = "Ответили $reachable из ${targets.size}"
+        }
+    }
+
+    // ==================== маршрутизация доменов/IP ====================
+
+    fun refreshRouteSets() {
+        routeSetNames = routeSetStore.listSets()
+        if (activeRouteSet.isBlank() || activeRouteSet !in routeSetNames) {
+            activeRouteSet = routeSetNames.firstOrNull() ?: ""
+        }
+        routeRules = activeRouteSet.takeIf { it.isNotBlank() }?.let { routeSetStore.load(it) } ?: emptyList()
+    }
+
+    fun switchRouteSet(setName: String) {
+        activeRouteSet = setName
+        routeRules = routeSetStore.load(setName)
+    }
+
+    fun addRouteRule(value: String, action: RouteAction) {
+        val trimmed = value.trim()
+        if (!RouteSetStore.isValidValue(trimmed)) {
+            feedback = "Введите домен, IP-адрес или ключевое слово."
+            return
+        }
+        if (routeRules.any { it.value.equals(trimmed, ignoreCase = true) }) {
+            feedback = "Такое правило уже есть в наборе."
+            return
+        }
+        if (activeRouteSet.isBlank()) activeRouteSet = "default"
+        routeRules = routeRules + RouteRule(trimmed, action)
+        routeSetStore.save(activeRouteSet, routeRules)
+        routeSetNames = routeSetStore.listSets()
+    }
+
+    fun removeRouteRule(rule: RouteRule) {
+        routeRules = routeRules - rule
+        if (activeRouteSet.isNotBlank()) routeSetStore.save(activeRouteSet, routeRules)
+    }
+
+    /** Экспорт активного набора в json-текст (для сохранения в файл). */
+    fun exportActiveRouteSet(): String? {
+        if (activeRouteSet.isBlank()) {
+            feedback = "Нет активного набора правил."
+            return null
+        }
+        return routeSetStore.toJson(routeRules)
+    }
+
+    /** Импорт набора из json-текста; имя набора берётся из переданного. */
+    fun importRouteSet(setName: String, text: String): Boolean {
+        val rules = runCatching { routeSetStore.parseJson(text) }.getOrNull()
+        if (rules == null) {
+            feedback = "Файл не похож на набор правил GoreBox."
+            return false
+        }
+        val name = setName.trim().ifBlank { "imported" }
+        routeSetStore.save(name, rules)
+        routeSetNames = routeSetStore.listSets()
+        switchRouteSet(name)
+        feedback = "Набор «$name» импортирован (${rules.size} правил)"
+        return true
+    }
+
+    // ==================== приложения: proxy / direct ====================
+
+    /** PROXY — приложение в туннеле (include), DIRECT — мимо туннеля (exclude). */
+    fun setAppRoute(packageName: String, route: String?) {
+        val proxy = selectedPackages.toMutableSet()
+        val direct = directPackages.toMutableSet()
+        when (route) {
+            "proxy" -> { proxy.add(packageName); direct.remove(packageName) }
+            "direct" -> { direct.add(packageName); proxy.remove(packageName) }
+            else -> { proxy.remove(packageName); direct.remove(packageName) }
+        }
+        selectedPackages = proxy
+        directPackages = direct
+        store.selectedAppPackages = proxy
+        store.directAppPackages = direct
+    }
+
+    fun updateLaunchAtBoot(enabled: Boolean) {
+        launchAtBoot = enabled
+        store.launchAtBoot = enabled
     }
 
     private fun persistProfiles() = store.saveProfiles(profiles.toList())

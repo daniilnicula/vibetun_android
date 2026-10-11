@@ -75,13 +75,25 @@ class GoreBoxStore(context: Context) {
         get() = preferences.getBoolean(KEY_LAUNCH_AT_BOOT, false)
         set(value) { preferences.edit().putBoolean(KEY_LAUNCH_AT_BOOT, value).apply() }
 
+    /** Запоминание состояния: VPN работал при последнем завершении — включить после перезагрузки. */
+    var proxyWasActive: Boolean
+        get() = preferences.getBoolean(KEY_PROXY_WAS_ACTIVE, false)
+        set(value) { preferences.edit().putBoolean(KEY_PROXY_WAS_ACTIVE, value).apply() }
+
+    /** Приложения с маршрутом DIRECT: идут мимо туннеля (exclude). */
+    var directAppPackages: Set<String>
+        get() = preferences.getStringSet(KEY_DIRECT_APPS, emptySet())?.toSet().orEmpty()
+        set(value) { preferences.edit().putStringSet(KEY_DIRECT_APPS, value.toSet()).apply() }
+
     companion object {
         private const val KEY_PROFILES = "profiles"
         private const val KEY_SELECTED_PROFILE = "selected_profile"
         private const val KEY_DARK_THEME = "dark_theme"
         private const val KEY_SELECTED_APPS = "selected_apps"
+        private const val KEY_DIRECT_APPS = "direct_apps"
         private const val KEY_SELECTED_APPS_ONLY = "selected_apps_only"
         private const val KEY_POWER_SETUP_COMPLETE = "power_setup_complete"
         private const val KEY_LAUNCH_AT_BOOT = "launch_at_boot"
+        private const val KEY_PROXY_WAS_ACTIVE = "proxy_was_active"
     }
 }

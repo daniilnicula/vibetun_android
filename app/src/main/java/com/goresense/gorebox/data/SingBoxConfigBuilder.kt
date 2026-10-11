@@ -12,14 +12,25 @@ object SingBoxConfigBuilder {
     private const val PROXY_TAG = "gorebox-proxy"
     private const val TUN_TAG = "gorebox-tun"
     private const val DNS_TAG = "gorebox-dns"
+    private const val DIRECT_TAG = "gorebox-direct"
+    private const val DNS_DIRECT_TAG = "gorebox-dns-direct"
 
     fun build(
         profile: ProxyProfile,
         selectedPackages: Set<String> = emptySet(),
         selectedAppsOnly: Boolean = false,
+        directPackages: Set<String> = emptySet(),
+        routeRules: List<RouteRule> = emptyList(),
     ): String {
         require(profile.source.isNotBlank()) { "У профиля нет исходной ссылки или конфигурации." }
         val packageList = selectedPackages.asSequence()
+            .filter { it.isNotBlank() }
+            .filterNot { it == "com.goresense.gorebox" }
+            .filterNot { it in directPackages }
+            .distinct()
+            .sorted()
+            .toList()
+        val directList = directPackages.asSequence()
             .filter { it.isNotBlank() }
             .filterNot { it == "com.goresense.gorebox" }
             .distinct()
@@ -34,29 +45,31 @@ object SingBoxConfigBuilder {
             val json = runCatching { JSONObject(source) }
                 .getOrElse { throw IllegalArgumentException("Некорректный JSON-конфиг: ${it.message}") }
             if (json.has("outbounds")) {
-                return normalizeFullConfig(json, packageList, selectedAppsOnly).toString()
+                return normalizeFullConfig(json, packageList, selectedAppsOnly, directList, routeRules).toString()
             }
             val type = json.optString("type").ifBlank { json.optString("protocol") }
             require(type.isNotBlank()) { "В JSON не найден тип прокси или список outbounds." }
             val outbound = JSONObject(json.toString()).put("type", type).put("tag", PROXY_TAG)
-            return createServiceConfig(outbound, packageList, selectedAppsOnly).toString()
+            return createServiceConfig(outbound, packageList, selectedAppsOnly, directList, routeRules).toString()
         }
         require(!source.startsWith("[") || source.contains("[Interface]", ignoreCase = true)) {
             "JSON-массив не является конфигурацией sing-box. Нужен объект с outbounds или профиль-ссылка."
         }
         val outbound = createOutbound(profile.protocol, source)
-        return createServiceConfig(outbound, packageList, selectedAppsOnly).toString()
+        return createServiceConfig(outbound, packageList, selectedAppsOnly, directList, routeRules).toString()
     }
 
     private fun createServiceConfig(
         proxy: JSONObject,
         packages: List<String>,
         selectedAppsOnly: Boolean,
+        directPackages: List<String>,
+        routeRules: List<RouteRule>,
     ): JSONObject {
         proxy.put("tag", PROXY_TAG)
         val config = JSONObject()
         config.put("log", JSONObject().put("level", "warn"))
-        config.put("inbounds", JSONArray().put(createTunInbound(packages, selectedAppsOnly)))
+        config.put("inbounds", JSONArray().put(createTunInbound(packages, selectedAppsOnly, directPackages)))
         config.put(
             "outbounds",
             JSONArray()
@@ -67,27 +80,27 @@ object SingBoxConfigBuilder {
             "route",
             JSONObject()
                 .put("auto_detect_interface", true)
+                .put("rules", createRouteRules(routeRules))
                 .put("final", PROXY_TAG),
         )
         config.put(
             "dns",
             JSONObject()
-                .put(
-                    "servers",
-                    JSONArray().put(
-                        JSONObject()
-                            .put("tag", DNS_TAG)
-                            .put("address", "https://1.1.1.1/dns-query")
-                            .put("detour", PROXY_TAG),
-                    ),
-                )
+                .put("servers", createDnsServers(hasDirectDomains(routeRules)))
+                .put("rules", createDnsRules(routeRules))
                 .put("final", DNS_TAG)
                 .put("strategy", "prefer_ipv4"),
         )
         return config
     }
 
-    private fun normalizeFullConfig(config: JSONObject, packages: List<String>, selectedAppsOnly: Boolean): JSONObject {
+    private fun normalizeFullConfig(
+        config: JSONObject,
+        packages: List<String>,
+        selectedAppsOnly: Boolean,
+        directPackages: List<String>,
+        routeRules: List<RouteRule>,
+    ): JSONObject {
         val outbounds = config.optJSONArray("outbounds")
             ?: throw IllegalArgumentException("В конфигурации отсутствует массив outbounds.")
         require(outbounds.length() > 0) { "В конфигурации нет исходящих подключений (outbounds)." }
@@ -102,7 +115,7 @@ object SingBoxConfigBuilder {
             }
         }
         if (tun == null) {
-            tun = createTunInbound(packages, selectedAppsOnly)
+            tun = createTunInbound(packages, selectedAppsOnly, directPackages)
             inbounds.put(tun)
         } else {
             tun.put("auto_route", true)
@@ -110,6 +123,7 @@ object SingBoxConfigBuilder {
             if (!tun.has("inet4_address")) tun.put("inet4_address", JSONArray().put("172.19.0.1/30"))
             if (!tun.has("inet6_address")) tun.put("inet6_address", JSONArray().put("fd00:676f:7265::1/126"))
             if (selectedAppsOnly) tun.put("include_package", JSONArray(packages))
+            if (directPackages.isNotEmpty()) tun.put("exclude_package", JSONArray(directPackages))
         }
         // Android's system stack may try to bind sockets to the virtual IPv6 address and fail
         // with EADDRNOTAVAIL. gVisor keeps the TCP/IP stack inside the process and avoids that.
@@ -130,11 +144,76 @@ object SingBoxConfigBuilder {
             route.put("final", proxyTag)
         }
         route.put("auto_detect_interface", true)
+        val userRules = createRouteRules(routeRules)
+        for (index in userRules.length() - 1 downTo 0) {
+            route.optJSONArray("rules")?.put(0, userRules.getJSONObject(index))
+        }
+        if (route.optJSONArray("rules") == null && userRules.length() > 0) route.put("rules", userRules)
         config.put("route", route)
         return config
     }
 
-    private fun createTunInbound(packages: List<String>, selectedAppsOnly: Boolean): JSONObject {
+    /** Правила маршрутизации: DIRECT-значения уходят в gorebox-direct, остальное решает final. */
+    private fun createRouteRules(rules: List<RouteRule>): JSONArray {
+        val direct = rules.filter { it.action == RouteAction.DIRECT }
+        fun valuesOf(type: RouteRuleType): JSONArray = JSONArray().apply {
+            direct.filter { it.type == type }.forEach { rule ->
+                put(
+                    if (type == RouteRuleType.KEYWORD) RouteRule.keywordRegex(rule.value)
+                    else rule.value.trim().removePrefix("*."),
+                )
+            }
+        }
+        val result = JSONArray()
+        val suffix = valuesOf(RouteRuleType.DOMAIN_SUFFIX)
+        val keyword = valuesOf(RouteRuleType.KEYWORD)
+        val cidr = valuesOf(RouteRuleType.IP_CIDR)
+        if (suffix.length() > 0) result.put(JSONObject().put("domain_suffix", suffix).put("outbound", DIRECT_TAG))
+        if (keyword.length() > 0) result.put(JSONObject().put("domain_regex", keyword).put("outbound", DIRECT_TAG))
+        if (cidr.length() > 0) result.put(JSONObject().put("ip_cidr", cidr).put("outbound", DIRECT_TAG))
+        return result
+    }
+
+    private fun createDnsServers(hasDirectDomains: Boolean): JSONArray = JSONArray().apply {
+        put(
+            JSONObject()
+                .put("tag", DNS_TAG)
+                .put("address", "https://1.1.1.1/dns-query")
+                .put("detour", PROXY_TAG),
+        )
+        if (hasDirectDomains) {
+            put(
+                JSONObject()
+                    .put("tag", DNS_DIRECT_TAG)
+                    .put("address", "local")
+                    .put("detour", DIRECT_TAG),
+            )
+        }
+    }
+
+    private fun createDnsRules(rules: List<RouteRule>): JSONArray {
+        val direct = rules.filter { it.action == RouteAction.DIRECT && it.type != RouteRuleType.IP_CIDR }
+        if (direct.isEmpty()) return JSONArray()
+        fun valuesOf(type: RouteRuleType): JSONArray = JSONArray().apply {
+            direct.filter { it.type == type }.forEach { rule ->
+                put(
+                    if (type == RouteRuleType.KEYWORD) RouteRule.keywordRegex(rule.value)
+                    else rule.value.trim().removePrefix("*."),
+                )
+            }
+        }
+        val rule = JSONObject().put("server", DNS_DIRECT_TAG)
+        val suffix = valuesOf(RouteRuleType.DOMAIN_SUFFIX)
+        val keyword = valuesOf(RouteRuleType.KEYWORD)
+        if (suffix.length() > 0) rule.put("domain_suffix", suffix)
+        if (keyword.length() > 0) rule.put("domain_regex", keyword)
+        return JSONArray().put(rule)
+    }
+
+    private fun hasDirectDomains(rules: List<RouteRule>): Boolean =
+        rules.any { it.action == RouteAction.DIRECT && it.type != RouteRuleType.IP_CIDR }
+
+    private fun createTunInbound(packages: List<String>, selectedAppsOnly: Boolean, directPackages: List<String>): JSONObject {
         val tun = JSONObject()
             .put("type", "tun")
             .put("tag", TUN_TAG)
@@ -145,6 +224,7 @@ object SingBoxConfigBuilder {
             .put("strict_route", true)
             .put("stack", "gvisor")
         if (selectedAppsOnly) tun.put("include_package", JSONArray(packages))
+        if (directPackages.isNotEmpty()) tun.put("exclude_package", JSONArray(directPackages))
         return tun
     }
 

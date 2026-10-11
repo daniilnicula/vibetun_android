@@ -31,12 +31,14 @@ import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ContentPaste
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.DarkMode
+import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.outlined.MoreVert
+import androidx.compose.material.icons.outlined.NetworkPing
 import androidx.compose.material.icons.outlined.PowerSettingsNew
 import androidx.compose.material.icons.outlined.Route
 import androidx.compose.material.icons.outlined.Search
@@ -44,6 +46,7 @@ import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.outlined.Upload
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
@@ -87,6 +90,7 @@ import com.goresense.gorebox.data.InstalledApp
 import com.goresense.gorebox.data.ProtocolCatalog
 import com.goresense.gorebox.data.ProxyMode
 import com.goresense.gorebox.data.ProxyProfile
+import com.goresense.gorebox.data.RouteAction
 import com.goresense.gorebox.service.NativeCoreStatus
 
 @Composable
@@ -99,6 +103,8 @@ fun GoreBoxRoot(
     onOpenAppSettings: () -> Unit,
     onBatteryStatusRefresh: () -> Unit,
     onCopyProfile: (ProxyProfile) -> Unit = {},
+    onExportRules: () -> Unit = {},
+    onImportRules: () -> Unit = {},
 ) {
     val palette = LocalGorePalette.current
     val snackbarHost = remember { SnackbarHostState() }
@@ -135,7 +141,7 @@ fun GoreBoxRoot(
                         onRemove = { removingProfile = it },
                         onCopy = onCopyProfile,
                     )
-                    AppTab.Routing -> RoutingPage(viewModel)
+                    AppTab.Routing -> RoutingPage(viewModel, onExportRules = onExportRules, onImportRules = onImportRules)
                     AppTab.Settings -> SettingsPage(
                         viewModel = viewModel,
                         onOpenBatterySettings = onOpenBatterySettings,
@@ -313,6 +319,12 @@ private fun ProfilesPage(
                 Text("СОХРАНЁННЫЕ ПРОФИЛИ", color = p.textMuted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.05.sp)
                 Text("${viewModel.profiles.size} ${profileCountWord(viewModel.profiles.size)}", color = p.textSecondary, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
             }
+            SmallActionButton(
+                label = if (viewModel.pingingAll) "Пинг…" else "Ping all",
+                icon = Icons.Outlined.NetworkPing,
+                onClick = { viewModel.pingAll() },
+            )
+            Spacer(Modifier.width(7.dp))
             SmallActionButton(label = "Вставить", icon = Icons.Outlined.ContentPaste, onClick = onPaste)
             Spacer(Modifier.width(7.dp))
             AddButton(onClick = onAddManual)
@@ -336,11 +348,13 @@ private fun ProfilesPage(
                         profile = profile,
                         selected = profile.id == viewModel.selectedProfileId,
                         connected = viewModel.isConnected && profile.id == viewModel.selectedProfileId,
+                        pinging = profile.id in viewModel.pingingIds,
                         onSelect = { viewModel.selectProfile(profile.id) },
                         onEdit = { onEdit(profile) },
                         onRemove = { onRemove(profile) },
                         onFavorite = { viewModel.toggleFavorite(profile) },
                         onCopy = { onCopy(profile) },
+                        onPing = { viewModel.pingProfile(profile.id) },
                     )
                     Spacer(Modifier.height(8.dp))
                 }
@@ -500,11 +514,13 @@ private fun ProfileRow(
     profile: ProxyProfile,
     selected: Boolean,
     connected: Boolean,
+    pinging: Boolean = false,
     onSelect: () -> Unit,
     onEdit: () -> Unit,
     onRemove: () -> Unit,
     onFavorite: () -> Unit,
     onCopy: () -> Unit,
+    onPing: () -> Unit = {},
 ) {
     val p = LocalGorePalette.current
     var menuExpanded by remember(profile.id) { mutableStateOf(false) }
@@ -546,7 +562,9 @@ private fun ProfileRow(
                     modifier = Modifier.padding(top = 4.dp),
                 )
             }
-            if (profile.latencyMs != null) {
+            if (pinging) {
+                Text("пинг…", color = p.warning, fontSize = 10.sp, modifier = Modifier.padding(end = 1.dp))
+            } else if (profile.latencyMs != null) {
                 Text("${profile.latencyMs} ms", color = p.textSecondary, fontSize = 10.sp, modifier = Modifier.padding(end = 1.dp))
             }
             Box {
@@ -554,6 +572,11 @@ private fun ProfileRow(
                     Icon(Icons.Outlined.MoreVert, contentDescription = "Действия профиля", tint = p.textMuted, modifier = Modifier.size(19.dp))
                 }
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Замерить пинг") },
+                        leadingIcon = { Icon(Icons.Outlined.NetworkPing, contentDescription = null) },
+                        onClick = { menuExpanded = false; onPing() },
+                    )
                     DropdownMenuItem(
                         text = { Text(if (profile.favorite) "Убрать из избранного" else "В избранное") },
                         leadingIcon = { Icon(if (profile.favorite) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder, contentDescription = null) },
@@ -581,9 +604,15 @@ private fun ProfileRow(
 }
 
 @Composable
-private fun RoutingPage(viewModel: GoreBoxViewModel) {
+private fun RoutingPage(
+    viewModel: GoreBoxViewModel,
+    onExportRules: () -> Unit,
+    onImportRules: () -> Unit,
+) {
     val p = LocalGorePalette.current
     var appSearch by remember { mutableStateOf("") }
+    var ruleInput by remember { mutableStateOf("") }
+    var ruleAction by remember { mutableStateOf(RouteAction.DIRECT) }
     val filteredApps = remember(viewModel.installedApps, appSearch) {
         viewModel.installedApps.filter { app ->
             app.label.contains(appSearch, ignoreCase = true) || app.packageName.contains(appSearch, ignoreCase = true)
@@ -595,7 +624,7 @@ private fun RoutingPage(viewModel: GoreBoxViewModel) {
             .verticalScroll(rememberScrollState())
             .padding(horizontal = 18.dp),
     ) {
-        PageHeading(title = "Маршрутизация", subtitle = "Режим прокси и приложения Android")
+        PageHeading(title = "Маршрутизация", subtitle = "Правила доменов/IP, режим прокси и приложения Android")
         PanelCard(Modifier.fillMaxWidth().padding(top = 5.dp, bottom = 13.dp)) {
             Row(Modifier.padding(13.dp), verticalAlignment = Alignment.Top) {
                 Icon(Icons.Outlined.Info, contentDescription = null, tint = p.accent, modifier = Modifier.size(19.dp))
@@ -611,23 +640,125 @@ private fun RoutingPage(viewModel: GoreBoxViewModel) {
                 }
             }
         }
+
+        // ==================== правила доменов/IP ====================
+        PanelCard(Modifier.fillMaxWidth().padding(bottom = 13.dp)) {
+            Column(Modifier.padding(13.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Правила маршрутизации", color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (viewModel.activeRouteSet.isBlank()) "Набор не создан" else "Набор: ${viewModel.activeRouteSet} · ${viewModel.routeRules.size} правил",
+                            color = p.textMuted,
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(top = 3.dp),
+                        )
+                    }
+                    StatusTag(text = "ROUTE", tone = p.accent)
+                }
+                Text(
+                    "Домен (yandex.ru — с поддоменами), IP/CIDR (1.2.3.0/24) или ключевое слово (youtube — regex-вхождение). DIRECT уходит мимо прокси.",
+                    color = p.textMuted,
+                    fontSize = 10.sp,
+                    lineHeight = 14.sp,
+                    modifier = Modifier.padding(top = 8.dp),
+                )
+
+                viewModel.routeRules.forEach { rule ->
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            rule.value,
+                            color = p.text,
+                            fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        StatusTag(
+                            text = if (rule.action == RouteAction.DIRECT) "DIRECT" else "PROXY",
+                            tone = if (rule.action == RouteAction.DIRECT) p.warning else p.success,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        IconButton(
+                            onClick = { viewModel.removeRouteRule(rule) },
+                            modifier = Modifier.size(28.dp),
+                        ) {
+                            Icon(Icons.Outlined.Close, contentDescription = "Удалить правило", tint = p.textMuted, modifier = Modifier.size(15.dp))
+                        }
+                    }
+                }
+
+                Row(Modifier.padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = ruleInput,
+                        onValueChange = { ruleInput = it },
+                        placeholder = { Text("Домен, IP или ключевое слово", fontSize = 11.sp) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(7.dp))
+                    Column {
+                        Row {
+                            listOf(RouteAction.DIRECT, RouteAction.PROXY).forEach { action ->
+                                val selected = ruleAction == action
+                                Surface(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable { ruleAction = action },
+                                    color = if (selected) (if (action == RouteAction.DIRECT) p.warningSoft else p.accentSoft) else p.cardAlt,
+                                    border = BorderStroke(1.dp, if (selected) (if (action == RouteAction.DIRECT) p.warning else p.accent) else p.border),
+                                ) {
+                                    Text(
+                                        if (action == RouteAction.DIRECT) "DIRECT" else "PROXY",
+                                        color = if (selected) (if (action == RouteAction.DIRECT) p.warning else p.accent) else p.textMuted,
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                                    )
+                                }
+                                Spacer(Modifier.width(5.dp))
+                            }
+                        }
+                        Spacer(Modifier.height(5.dp))
+                        SecondaryActionButton(
+                            label = "Добавить",
+                            icon = Icons.Outlined.Add,
+                            onClick = {
+                                viewModel.addRouteRule(ruleInput, ruleAction)
+                                ruleInput = ""
+                            },
+                        )
+                    }
+                }
+
+                Row(Modifier.padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SecondaryActionButton("Экспорт набора", Icons.Outlined.Upload, onExportRules, Modifier.weight(1f))
+                    SecondaryActionButton("Импорт набора", Icons.Outlined.Download, onImportRules, Modifier.weight(1f))
+                }
+            }
+        }
+
+        // ==================== режим и приложения ====================
         Text("РЕЖИМ", color = p.textMuted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, modifier = Modifier.padding(bottom = 8.dp))
         ProxyMode.entries.forEach { mode ->
             ModeCard(mode = mode, selected = viewModel.proxyMode == mode, onClick = { viewModel.updateProxyMode(mode) })
             Spacer(Modifier.height(8.dp))
         }
-        if (viewModel.proxyMode == ProxyMode.SelectedApps) {
+        if (viewModel.proxyMode == ProxyMode.SelectedApps || viewModel.directPackages.isNotEmpty()) {
             PanelCard(Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 14.dp)) {
                 Column(Modifier.padding(13.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text("Приложения в туннеле", color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                            Text("Выбрано: ${viewModel.selectedPackages.size}", color = p.textMuted, fontSize = 10.sp, modifier = Modifier.padding(top = 3.dp))
+                            Text("PROXY: ${viewModel.selectedPackages.size} · DIRECT: ${viewModel.directPackages.size}", color = p.textMuted, fontSize = 10.sp, modifier = Modifier.padding(top = 3.dp))
                         }
                         StatusTag(text = "PER-APP", tone = p.accent)
                     }
                     Text(
-                        "Список применяется только после подключения совместимого ядра GoreBox.",
+                        "PROXY — приложение идёт через VPN (в режиме «Выбранные»), DIRECT — мимо туннеля. Правило DIRECT работает в любом режиме.",
                         color = p.warning,
                         fontSize = 10.sp,
                         lineHeight = 14.sp,
@@ -645,10 +776,15 @@ private fun RoutingPage(viewModel: GoreBoxViewModel) {
                         Text("Приложения не найдены.", color = p.textMuted, fontSize = 11.sp, modifier = Modifier.padding(vertical = 12.dp))
                     } else {
                         filteredApps.take(80).forEach { app ->
+                            val route = when {
+                                app.packageName in viewModel.directPackages -> "direct"
+                                app.packageName in viewModel.selectedPackages -> "proxy"
+                                else -> null
+                            }
                             InstalledAppRow(
                                 app = app,
-                                checked = app.packageName in viewModel.selectedPackages,
-                                onToggle = { viewModel.togglePackage(app.packageName) },
+                                route = route,
+                                onRoute = { viewModel.setAppRoute(app.packageName, it) },
                             )
                         }
                         if (filteredApps.size > 80) {
@@ -693,10 +829,10 @@ private fun ModeCard(mode: ProxyMode, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun InstalledAppRow(app: InstalledApp, checked: Boolean, onToggle: () -> Unit) {
+private fun InstalledAppRow(app: InstalledApp, route: String?, onRoute: (String?) -> Unit) {
     val p = LocalGorePalette.current
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(vertical = 6.dp),
+        Modifier.fillMaxWidth().padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(Modifier.size(33.dp).clip(RoundedCornerShape(9.dp)).background(p.cardAlt), contentAlignment = Alignment.Center) {
@@ -706,14 +842,32 @@ private fun InstalledAppRow(app: InstalledApp, checked: Boolean, onToggle: () ->
             Text(app.label, color = p.text, fontSize = 11.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(app.packageName, color = p.textMuted, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
         }
-        Checkbox(
-            checked = checked,
-            onCheckedChange = { onToggle() },
-            colors = CheckboxDefaults.colors(
-                checkedColor = p.accent,
-                uncheckedColor = p.textMuted,
-                checkmarkColor = Color.White,
-            ),
+        AppRouteChip("PROXY", route == "proxy", p.accent, p.accentSoft) { onRoute(if (route == "proxy") null else "proxy") }
+        Spacer(Modifier.width(5.dp))
+        AppRouteChip("DIRECT", route == "direct", p.warning, p.warningSoft) { onRoute(if (route == "direct") null else "direct") }
+    }
+}
+
+@Composable
+private fun AppRouteChip(
+    label: String,
+    selected: Boolean,
+    activeColor: Color,
+    activeSoft: Color,
+    onClick: () -> Unit,
+) {
+    val p = LocalGorePalette.current
+    Surface(
+        modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable(onClick = onClick),
+        color = if (selected) activeSoft else p.cardAlt,
+        border = BorderStroke(1.dp, if (selected) activeColor else p.border),
+    ) {
+        Text(
+            label,
+            color = if (selected) activeColor else p.textMuted,
+            fontSize = 8.5.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
         )
     }
 }
@@ -743,6 +897,26 @@ private fun SettingsPage(
                     description = "Палитра GoreBox для Windows и Android",
                     checked = viewModel.darkTheme,
                     onCheckedChange = viewModel::updateDarkTheme,
+                )
+            }
+        }
+
+        PanelCard(Modifier.fillMaxWidth().padding(top = 12.dp)) {
+            Column(Modifier.padding(15.dp)) {
+                Text("ЗАПУСК И ФОН", color = p.textMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                SettingToggleRow(
+                    icon = Icons.Outlined.PowerSettingsNew,
+                    title = "Автозапуск VPN при загрузке",
+                    description = "После перезагрузки устройства VPN включится, если работал до неё",
+                    checked = viewModel.launchAtBoot,
+                    onCheckedChange = viewModel::updateLaunchAtBoot,
+                )
+                Text(
+                    "Android может задерживать автозапуск на отдельных прошивках — там дополнительно включите автозапуск GoreBox в настройках системы.",
+                    color = p.textMuted,
+                    fontSize = 10.sp,
+                    lineHeight = 14.sp,
+                    modifier = Modifier.padding(top = 6.dp),
                 )
             }
         }

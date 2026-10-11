@@ -22,6 +22,7 @@ import com.goresense.gorebox.data.AmneziaWgConfig
 import com.goresense.gorebox.data.ConnectionState
 import com.goresense.gorebox.data.GoreBoxStore
 import com.goresense.gorebox.data.ProxyProfile
+import com.goresense.gorebox.data.RouteSetStore
 import com.goresense.gorebox.data.SingBoxConfigBuilder
 import io.nekohasekai.libbox.BoxService
 import io.nekohasekai.libbox.InterfaceUpdateListener
@@ -100,6 +101,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
                 startSingBox(profile)
             }
             stateStore.update(ConnectionState.RUNNING, "Прокси включён · ${profile.name}")
+            profileStore.proxyWasActive = true
             Log.i(TAG, "Proxy core started for profile ${profile.id} (${profile.protocol})")
         } catch (error: Throwable) {
             if (error is VirtualMachineError || error is ThreadDeath) throw error
@@ -113,12 +115,20 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
             profile = profile,
             selectedPackages = profileStore.selectedAppPackages,
             selectedAppsOnly = profileStore.selectedAppsOnly,
+            directPackages = profileStore.directAppPackages,
+            routeRules = RouteSetStore(this).load(activeRouteSet()),
         )
         val basePath = filesDir.absolutePath
         Libbox.setup(basePath, basePath, cacheDir.absolutePath, false)
         val service = Libbox.newService(config, this)
         boxService = service
         service.start()
+    }
+
+    private fun activeRouteSet(): String {
+        val store = RouteSetStore(this)
+        val sets = store.listSets()
+        return sets.firstOrNull() ?: ""
     }
 
     private fun startAmneziaWg(profile: ProxyProfile) {
@@ -155,6 +165,11 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
                 "Для режима «Выбранные приложения» отметьте хотя бы одно приложение."
             }
             addApplications(builder, StringIteratorImpl(selectedPackages), allowed = true)
+        }
+        // приложения с маршрутом DIRECT идут мимо туннеля AmneziaWG
+        val directPackages = profileStore.directAppPackages.sorted()
+        if (directPackages.isNotEmpty()) {
+            addApplications(builder, StringIteratorImpl(directPackages), allowed = false)
         }
 
         val establishedTun = checkNotNull(builder.establish()) { "Android did not establish the AmneziaWG VPN interface." }
@@ -246,6 +261,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
 
     private fun fail(message: String) {
         stateStore.update(ConnectionState.ERROR, message)
+        profileStore.proxyWasActive = false
         closeNativeService()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -253,6 +269,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
 
     private fun stopConnection() {
         closeNativeService()
+        profileStore.proxyWasActive = false
         stateStore.update(ConnectionState.STOPPED)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()

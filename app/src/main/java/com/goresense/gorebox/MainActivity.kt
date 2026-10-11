@@ -46,6 +46,35 @@ class MainActivity : ComponentActivity() {
         if (uri != null) importFromUri(uri)
     }
 
+    private val exportRulesFile = registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val json = viewModel.exportActiveRouteSet() ?: return@registerForActivityResult
+        runCatching {
+            contentResolver.openOutputStream(uri)?.writer()?.use { it.write(json) }
+        }.onSuccess {
+            viewModel.feedback = "Набор правил экспортирован."
+        }.onFailure {
+            viewModel.feedback = "Не удалось записать файл: ${it.message}"
+        }
+    }
+
+    private val importRulesFile = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        val content = runCatching {
+            contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+        }.getOrNull()
+        if (content.isNullOrBlank()) {
+            viewModel.feedback = "Не удалось прочитать файл."
+            return@registerForActivityResult
+        }
+        val setName = uri.lastPathSegment
+            ?.substringAfterLast('/')
+            ?.substringBeforeLast('.')
+            ?.takeIf { it.isNotBlank() }
+            ?: "imported"
+        viewModel.importRouteSet(setName, content)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -73,6 +102,8 @@ class MainActivity : ComponentActivity() {
                     onOpenAppSettings = ::openAppSettings,
                     onBatteryStatusRefresh = ::refreshBatteryStatus,
                     onCopyProfile = ::copyProfile,
+                    onExportRules = { exportRulesFile.launch("gorebox-rules.json") },
+                    onImportRules = { importRulesFile.launch(arrayOf("application/json", "text/*", "application/octet-stream")) },
                 )
                 LaunchedEffect(intent?.getBooleanExtra(EXTRA_CONNECT_FROM_TILE, false)) {
                     if (intent?.getBooleanExtra(EXTRA_CONNECT_FROM_TILE, false) == true) {
