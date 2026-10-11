@@ -609,9 +609,28 @@ public partial class MainWindow : Window
         {
             App.Settings.Current.CloseBehavior = result == true ? CloseBehavior.HideToTray : CloseBehavior.Exit;
             App.Settings.SaveSoon();
+            _vm?.Preferences.OnCloseBehaviorChangedExternally();
         }
         if (result == true) HideToTray();
         else ExitApplication();
+    }
+
+    /// <summary>Удалить сохранённые входы панелей (куки-профиль WebView2: логины, сессии, кэш сайтов).</summary>
+    public async Task ClearPanelLoginsAsync()
+    {
+        var confirmed = _dialogs?.Confirm("Удалить логины и пароли",
+            "Будут удалены все сохранённые входы панелей — куки и данные сайтов встроенного браузера. " +
+            "Сами панели и их адреса останутся. Продолжить?",
+            okText: "Удалить", danger: true) == true;
+        if (!confirmed) return;
+
+        PanelTab?.UnloadAll();
+        await Task.Delay(500);   // даём процессу WebView2 освободить папку профиля
+        var deleted = await PanelPage.ClearStoredLoginsAsync();
+        _dialogs?.Info("Логины и пароли",
+            deleted
+                ? "Сохранённые входы удалены. При следующем открытии сайтов панелей нужно будет войти заново."
+                : "Папка профиля сейчас занята — очистка выполнится автоматически при следующем запуске приложения.");
     }
 
     private void HideToTray()

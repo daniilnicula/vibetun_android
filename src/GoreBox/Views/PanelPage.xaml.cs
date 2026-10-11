@@ -30,10 +30,61 @@ public partial class PanelPage : UserControl
 
     private async void OnLoaded(object sender, RoutedEventArgs e) => await EnsureBrowserAsync();
 
+    private static string MarkerPath => Path.Combine(AppPaths.DataRoot, "run", "clear-webview2.flag");
+
     private static Task<CoreWebView2Environment> GetEnvAsync()
-        => _envTask ??= CoreWebView2Environment.CreateAsync(
+    {
+        // Если при прошлой очистке профиль занял процесс браузера — дочищаем его маркером сейчас.
+        if (File.Exists(MarkerPath))
+        {
+            try
+            {
+                var folder = Path.Combine(AppPaths.DataRoot, "webview2");
+                if (Directory.Exists(folder)) Directory.Delete(folder, recursive: true);
+                File.Delete(MarkerPath);
+            }
+            catch { /* папку кто-то держит — браузер стартует с текущим профилем, маркер останется */ }
+        }
+        return _envTask ??= CoreWebView2Environment.CreateAsync(
             browserExecutableFolder: null,
             userDataFolder: Path.Combine(AppPaths.DataRoot, "webview2"));
+    }
+
+    /// <summary>
+    /// Удалить профиль WebView2 (куки, кэш, сохранённые входы всех панелей).
+    /// Вызывающий код должен предварительно выгрузить браузеры (PanelView.UnloadAll).
+    /// Если папку занято — ставим маркер, и GetEnvAsync дочистит её при следующем запуске.
+    /// </summary>
+    public static async Task<bool> ClearStoredLoginsAsync()
+    {
+        var folder = Path.Combine(AppPaths.DataRoot, "webview2");
+        var deleted = await Task.Run(() =>
+        {
+            for (var i = 0; i < 5 && Directory.Exists(folder); i++)
+            {
+                try { Directory.Delete(folder, recursive: true); }
+                catch { Thread.Sleep(400); }
+            }
+            return !Directory.Exists(folder);
+        });
+
+        if (!deleted)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(MarkerPath)!);
+                await File.WriteAllTextAsync(MarkerPath, DateTime.Now.ToString("O"));
+            }
+            catch { /* ignore */ }
+        }
+        else if (File.Exists(MarkerPath))
+        {
+            try { File.Delete(MarkerPath); } catch { /* ignore */ }
+        }
+
+        _envTask = null;   // следующий браузер создаст окружение заново
+        return deleted;
+    }
 
     /// <summary>Создать браузер и открыть сохранённый URL (показ панели и возврат из трея).</summary>
     public async Task EnsureBrowserAsync()

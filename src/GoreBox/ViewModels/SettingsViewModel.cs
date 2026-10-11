@@ -119,6 +119,10 @@ public sealed class SettingsViewModel : ObservableObject
         }
     }
 
+    /// <summary>Режим закрытия изменён извне (диалог «Скрыть или выйти» запомнил выбор) —
+    /// поднимаем PropertyChanged, чтобы комбобокс в настройках перечитал значение.</summary>
+    public void OnCloseBehaviorChangedExternally() => Raise(nameof(CloseBehavior));
+
     public bool RememberState
     {
         get => _settings.Current.RememberState;

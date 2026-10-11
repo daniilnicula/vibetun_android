@@ -39,14 +39,18 @@ public partial class ProfilesView : UserControl
         while (current is not null)
         {
             if (current is T typed) return typed;
-            current = VisualTreeHelper.GetParent(current);
+            // TextElement (Run внутри TextBlock) не является Visual — VisualTreeHelper.GetParent
+            // падает с «not a Visual or Visual3D»; для них идём по логическому дереву.
+            current = current is Visual
+                ? VisualTreeHelper.GetParent(current)
+                : LogicalTreeHelper.GetParent(current);
         }
         return null;
     }
 
     private static T? FindChild<T>(DependencyObject? parent) where T : DependencyObject
     {
-        if (parent is null) return null;
+        if (parent is null || parent is not Visual) return null;
         for (var i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
         {
             var child = VisualTreeHelper.GetChild(parent, i);
