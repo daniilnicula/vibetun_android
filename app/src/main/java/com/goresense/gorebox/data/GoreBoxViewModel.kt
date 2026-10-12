@@ -203,6 +203,12 @@ class GoreBoxViewModel(application: Application) : AndroidViewModel(application)
         connectionMessage = connectionStore.message
     }
 
+    /** Тихое обновление полей из broadcast сервиса :vpn — без записи в prefs и реброадкаста. */
+    fun onConnectionStateFromService(state: ConnectionState, message: String) {
+        connectionState = state
+        connectionMessage = message
+    }
+
     fun setConnectionState(state: ConnectionState, message: String = "") {
         connectionStore.update(state, message)
         refreshConnectionState()

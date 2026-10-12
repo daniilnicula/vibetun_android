@@ -36,8 +36,10 @@ class MainActivity : ComponentActivity() {
             if (stateName != null) {
                 val state = runCatching { com.goresense.gorebox.data.ConnectionState.valueOf(stateName) }
                     .getOrNull() ?: return
-                viewModel.connectionState = state
-                viewModel.connectionMessage = intent.getStringExtra(ConnectionStateStore.EXTRA_MESSAGE).orEmpty()
+                viewModel.onConnectionStateFromService(
+                    state,
+                    intent.getStringExtra(ConnectionStateStore.EXTRA_MESSAGE).orEmpty(),
+                )
             } else {
                 viewModel.refreshConnectionState()
             }
