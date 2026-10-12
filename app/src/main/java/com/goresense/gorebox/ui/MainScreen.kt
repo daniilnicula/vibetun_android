@@ -1,5 +1,7 @@
 package com.goresense.gorebox.ui
 
+import android.content.Intent
+import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -44,6 +46,7 @@ import androidx.compose.material.icons.outlined.Route
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Upload
@@ -76,12 +79,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.FileProvider
+import com.goresense.gorebox.data.AppLog
 import com.goresense.gorebox.R
 import com.goresense.gorebox.data.AppTab
 import com.goresense.gorebox.data.ConnectionState
@@ -986,6 +992,45 @@ private fun SettingsPage(
                     fontSize = 9.sp,
                     modifier = Modifier.padding(top = 4.dp),
                 )
+            }
+        }
+
+        PanelCard(Modifier.fillMaxWidth().padding(top = 12.dp)) {
+            Column(Modifier.padding(15.dp)) {
+                Text("ДИАГНОСТИКА", color = p.textMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                Text(
+                    "Логи подключений и ошибок пишутся в файл. Отправьте их разработчику, если что-то не работает.",
+                    color = p.textMuted,
+                    fontSize = 10.sp,
+                    lineHeight = 14.sp,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                Row(Modifier.padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val context = LocalContext.current
+                    SecondaryActionButton("Поделиться логами", Icons.Outlined.Share, {
+                        AppLog.i("UI", "Пользователь отправил логи")
+                        val logFile = AppLog.file(context)
+                        if (!logFile.exists()) {
+                            Toast.makeText(context, "Лог-файл ещё не создан", Toast.LENGTH_SHORT).show()
+                            return@SecondaryActionButton
+                        }
+                        runCatching {
+                            val uri = FileProvider.getUriForFile(
+                                context,
+                                "${context.packageName}.fileprovider",
+                                logFile,
+                            )
+                            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                type = "text/plain"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(Intent.createChooser(sendIntent, "Отправить логи GoreBox"))
+                        }.onFailure { error ->
+                            Toast.makeText(context, "Не удалось отправить логи: ${error.message}", Toast.LENGTH_LONG).show()
+                        }
+                    }, Modifier.weight(1f))
+                }
             }
         }
 

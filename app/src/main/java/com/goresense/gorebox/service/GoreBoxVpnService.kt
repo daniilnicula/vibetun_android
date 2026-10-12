@@ -19,6 +19,7 @@ import androidx.core.app.NotificationCompat
 import com.goresense.gorebox.MainActivity
 import com.goresense.gorebox.R
 import com.goresense.gorebox.data.AmneziaWgConfig
+import com.goresense.gorebox.data.AppLog
 import com.goresense.gorebox.data.ConnectionState
 import com.goresense.gorebox.data.GoreBoxStore
 import com.goresense.gorebox.data.ProxyProfile
@@ -61,6 +62,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        AppLog.i(TAG, "onStartCommand action=${intent?.action ?: ACTION_START}")
         when (intent?.action ?: ACTION_START) {
             ACTION_STOP -> stopConnection()
             ACTION_TOGGLE -> if (isProxyActive()) stopConnection() else startConnection()
@@ -73,6 +75,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     private fun startConnection() {
         if (isProxyActive()) return
         if (!NativeCoreStatus.isIntegrated) {
+            AppLog.e(TAG, "startConnection: ядро не собрано — ${NativeCoreStatus.message}")
             fail(NativeCoreStatus.message)
             return
         }
@@ -95,6 +98,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
 
         try {
             val profile = loadSelectedProfile()
+            AppLog.i(TAG, "startConnection: профиль ${profile.id} (${profile.protocol}) ${profile.name}")
             if (profile.protocol.equals("amneziawg", ignoreCase = true)) {
                 startAmneziaWg(profile)
             } else {
@@ -103,14 +107,17 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
             stateStore.update(ConnectionState.RUNNING, "Прокси включён · ${profile.name}")
             profileStore.proxyWasActive = true
             Log.i(TAG, "Proxy core started for profile ${profile.id} (${profile.protocol})")
+            AppLog.i(TAG, "startConnection: ядро запущено успешно (${profile.protocol})")
         } catch (error: Throwable) {
             if (error is VirtualMachineError || error is ThreadDeath) throw error
             Log.e(TAG, "Failed to start proxy core", error)
+            AppLog.e(TAG, "Failed to start proxy core", error)
             fail(error.message?.takeIf { it.isNotBlank() } ?: "Не удалось запустить прокси-ядро.")
         }
     }
 
     private fun startSingBox(profile: ProxyProfile) {
+        AppLog.i(TAG, "startSingBox: сборка конфигурации…")
         val config = SingBoxConfigBuilder.build(
             profile = profile,
             selectedPackages = profileStore.selectedAppPackages,
@@ -119,10 +126,14 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
             routeRules = RouteSetStore(this).load(activeRouteSet()),
         )
         val basePath = filesDir.absolutePath
+        AppLog.i(TAG, "startSingBox: Libbox.setup(basePath=$basePath)")
         Libbox.setup(basePath, basePath, cacheDir.absolutePath, false)
+        AppLog.i(TAG, "startSingBox: Libbox.newService…")
         val service = Libbox.newService(config, this)
         boxService = service
+        AppLog.i(TAG, "startSingBox: service.start()…")
         service.start()
+        AppLog.i(TAG, "startSingBox: service.start() завершён")
     }
 
     private fun activeRouteSet(): String {
@@ -132,6 +143,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     }
 
     private fun startAmneziaWg(profile: ProxyProfile) {
+        AppLog.i(TAG, "startAmneziaWg: разбор конфигурации…")
         val config = AmneziaWgConfig.parse(profile.source)
         val userspaceConfig = config.userspaceConfig(::resolveAwgEndpoint)
         val builder = Builder()
@@ -176,6 +188,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         runCatching { tunDescriptor?.close() }
         tunDescriptor = establishedTun
         val nativeFd = ParcelFileDescriptor.dup(establishedTun.fileDescriptor).detachFd()
+        AppLog.i(TAG, "startAmneziaWg: TUN интерфейс создан, запуск awgTurnOn…")
         val handle = AmneziaGoBackend.awgTurnOn("gorebox-awg", nativeFd, userspaceConfig)
         check(handle >= 0) { "Не удалось запустить AmneziaWG. Проверьте ключи, endpoint и параметры конфигурации." }
         amneziaHandle = handle
@@ -189,6 +202,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
             check(protect(fd)) { "Android не смог исключить транспорт AmneziaWG из VPN." }
         }
         Log.i(TAG, "AmneziaWG ${AmneziaGoBackend.awgVersion()} started for profile ${profile.id}")
+        AppLog.i(TAG, "startAmneziaWg: запущено (${AmneziaGoBackend.awgVersion()})")
     }
 
     private fun parseIpPrefix(cidr: String): Pair<InetAddress, Int> {
@@ -260,6 +274,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     }
 
     private fun fail(message: String) {
+        AppLog.e(TAG, "fail: $message")
         stateStore.update(ConnectionState.ERROR, message)
         profileStore.proxyWasActive = false
         closeNativeService()
@@ -268,6 +283,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     }
 
     private fun stopConnection() {
+        AppLog.i(TAG, "stopConnection")
         closeNativeService()
         profileStore.proxyWasActive = false
         stateStore.update(ConnectionState.STOPPED)
@@ -506,6 +522,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     }
 
     override fun onDestroy() {
+        AppLog.i(TAG, "onDestroy")
         interfaceCallbacks.values.toList().forEach { callback ->
             runCatching { connectivity.unregisterNetworkCallback(callback) }
         }
