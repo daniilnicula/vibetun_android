@@ -30,7 +30,17 @@ class MainActivity : ComponentActivity() {
     private var stateReceiverRegistered = false
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            viewModel.refreshConnectionState()
+            // Сервис живёт в процессе :vpn, а SharedPreferences кэшируются per-process —
+            // надёжнее брать состояние прямо из extras broadcast, а не из prefs.
+            val stateName = intent.getStringExtra(ConnectionStateStore.EXTRA_STATE)
+            if (stateName != null) {
+                val state = runCatching { com.goresense.gorebox.data.ConnectionState.valueOf(stateName) }
+                    .getOrNull() ?: return
+                viewModel.connectionState = state
+                viewModel.connectionMessage = intent.getStringExtra(ConnectionStateStore.EXTRA_MESSAGE).orEmpty()
+            } else {
+                viewModel.refreshConnectionState()
+            }
         }
     }
 

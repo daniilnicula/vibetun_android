@@ -13,6 +13,7 @@ extern void awgTurnOff(int handle);
 extern int awgGetSocketV4(int handle);
 extern int awgGetSocketV6(int handle);
 extern char *awgVersion();
+extern char *awgGetStats(int handle);
 
 JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgTurnOn(JNIEnv *env, jclass c, jstring ifname, jint tun_fd, jstring settings)
 {
@@ -45,6 +46,17 @@ JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgGetSocketV4(JNIEnv *env
 JNIEXPORT jint JNICALL Java_org_amnezia_awg_GoBackend_awgGetSocketV6(JNIEnv *env, jclass c, jint handle)
 {
 	return awgGetSocketV6(handle);
+}
+
+JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgGetStats(JNIEnv *env, jclass c, jint handle)
+{
+	jstring ret;
+	char *stats = awgGetStats(handle);
+	if (!stats)
+		return NULL;
+	ret = (*env)->NewStringUTF(env, stats);
+	free(stats);
+	return ret;
 }
 
 JNIEXPORT jstring JNICALL Java_org_amnezia_awg_GoBackend_awgVersion(JNIEnv *env, jclass c)

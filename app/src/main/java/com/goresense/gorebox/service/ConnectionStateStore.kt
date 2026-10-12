@@ -24,7 +24,8 @@ class ConnectionStateStore(context: Context) {
             .apply()
         appContext.sendBroadcast(
             Intent(ACTION_STATE_CHANGED).setPackage(appContext.packageName)
-                .putExtra(EXTRA_STATE, state.name),
+                .putExtra(EXTRA_STATE, state.name)
+                .putExtra(EXTRA_MESSAGE, message),
         )
         runCatching {
             TileService.requestListeningState(
@@ -37,6 +38,7 @@ class ConnectionStateStore(context: Context) {
     companion object {
         const val ACTION_STATE_CHANGED = "com.goresense.gorebox.CONNECTION_STATE_CHANGED"
         const val EXTRA_STATE = "state"
+        const val EXTRA_MESSAGE = "message"
         private const val KEY_STATE = "state"
         private const val KEY_MESSAGE = "message"
     }
