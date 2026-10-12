@@ -168,11 +168,11 @@ func awgGetStats(tunnelHandle int32) *C.char {
 	if !ok {
 		return C.CString("")
 	}
-	builder := new(strings.Builder)
-	if err := handle.device.IpcGet(builder); err != nil {
+	config, err := handle.device.IpcGet()
+	if err != nil {
 		return C.CString("")
 	}
-	return C.CString(builder.String())
+	return C.CString(config)
 }
 
 //export awgVersion
