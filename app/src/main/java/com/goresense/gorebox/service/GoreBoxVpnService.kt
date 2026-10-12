@@ -68,6 +68,11 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         Thread(task, "GoreBox-AWG-DNS").apply { isDaemon = true }
     }
 
+    override fun onCreate() {
+        super.onCreate()
+        instance = this
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         AppLog.i(TAG, "onStartCommand action=${intent?.action ?: ACTION_START}")
         when (intent?.action ?: ACTION_START) {
@@ -644,6 +649,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
 
     override fun onDestroy() {
         AppLog.i(TAG, "onDestroy")
+        if (instance === this) instance = null
         mainHandler.removeCallbacksAndMessages(null)
         lastStoppedAtMs = SystemClock.elapsedRealtime()
         interfaceCallbacks.values.toList().forEach { callback ->
@@ -721,5 +727,10 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         /** Семейство последнего запущенного ядра (per-process). */
         @Volatile
         private var lastEngineFamily: String? = null
+
+        /** Активный экземпляр сервиса в этом процессе (для protect() probe-сокетов). */
+        @Volatile
+        var instance: GoreBoxVpnService? = null
+            private set
     }
 }

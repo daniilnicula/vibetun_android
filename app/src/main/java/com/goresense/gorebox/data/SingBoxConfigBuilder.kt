@@ -69,6 +69,45 @@ object SingBoxConfigBuilder {
         return createServiceConfig(outbound, packageList, selectedAppsOnly, directList, routeRules).toString()
     }
 
+    /**
+     * Минимальный конфиг для замера задержки профиля: локальный mixed-inbound (HTTP/SOCKS
+     * на 127.0.0.1) + исходящий outbound профиля. Замер = время HTTP-204 через этот прокси,
+     * так честно измеряются и UDP-протоколы (hysteria2/tuic), на которые TCP-ping не отвечает.
+     * null — протокол не поддерживается ядром sing-box (amneziawg) или некорректный источник.
+     */
+    fun buildProbeConfig(profile: ProxyProfile, port: Int): String? = runCatching {
+        val source = profile.source.trim()
+        val outbound = if (source.startsWith("{")) {
+            val json = JSONObject(source)
+            val outbounds = json.optJSONArray("outbounds") ?: return null
+            (0 until outbounds.length())
+                .asSequence()
+                .mapNotNull { outbounds.optJSONObject(it) }
+                .firstOrNull { it.optString("type") !in setOf("direct", "block", "dns") }
+                ?: return null
+        } else {
+            val protocol = profile.protocol.trim()
+            if (protocol.equals("amneziawg", ignoreCase = true)) return null
+            createOutbound(protocol, source)
+        }
+        outbound.put("tag", PROXY_TAG)
+        JSONObject()
+            .put("log", JSONObject().put("level", "panic"))
+            .put(
+                "inbounds",
+                JSONArray().put(
+                    JSONObject()
+                        .put("type", "mixed")
+                        .put("tag", "gorebox-probe")
+                        .put("listen", "127.0.0.1")
+                        .put("listen_port", port),
+                ),
+            )
+            .put("outbounds", JSONArray().put(outbound))
+            .put("route", JSONObject().put("auto_detect_interface", true).put("final", PROXY_TAG))
+            .toString()
+    }.getOrNull()
+
     private fun createServiceConfig(
         proxy: JSONObject,
         packages: List<String>,
@@ -250,7 +289,11 @@ object SingBoxConfigBuilder {
             .put("type", "tun")
             .put("tag", TUN_TAG)
             .put("inet4_address", JSONArray().put("172.19.0.1/30"))
-            .put("mtu", 1500)
+            // gVisor + MTU 9000 (как в Hiddify): QUIC-транспорты (hysteria2/tuic) сами
+            // режут датаграммы по своему PMTU; маленький MTU тут давал фрагментацию
+            // внешнего UDP и зависание крупных передач (видео YouTube — не грузилось,
+            // превью и TCP-сервисы — работали).
+            .put("mtu", 9000)
             .put("auto_route", true)
             .put("strict_route", true)
             .put("stack", "gvisor")

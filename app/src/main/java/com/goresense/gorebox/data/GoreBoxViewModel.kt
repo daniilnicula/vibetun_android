@@ -237,13 +237,13 @@ class GoreBoxViewModel(application: Application) : AndroidViewModel(application)
         feedback = null
     }
 
-    /** Замер задержки профиля: 3 попытки TCP-подключения, в список уходит лучшее значение. */
+    /** Замер задержки профиля: реальный HTTP-проброс через ядро sing-box (3 попытки, лучшее значение). */
     fun pingProfile(profileId: String) {
         val profile = profiles.firstOrNull { it.id == profileId } ?: return
         if (profileId in pingingIds) return
         pingingIds = pingingIds + profileId
         viewModelScope.launch {
-            val latency = withContext(Dispatchers.IO) { LatencyTester.ping(profile) }
+            val latency = withContext(Dispatchers.IO) { ProxyProbeTester.ping(getApplication(), profile) }
             pingingIds = pingingIds - profileId
             val index = profiles.indexOfFirst { it.id == profileId }
             if (index >= 0) profiles[index] = profiles[index].copy(latencyMs = latency)
@@ -262,8 +262,9 @@ class GoreBoxViewModel(application: Application) : AndroidViewModel(application)
         pingingAll = true
         pingingIds = targets.map { it.id }.toSet()
         viewModelScope.launch {
+            val app = getApplication<android.app.Application>()
             val results = withContext(Dispatchers.IO) {
-                targets.associate { it.id to LatencyTester.ping(it) }
+                targets.associate { it.id to ProxyProbeTester.ping(app, it) }
             }
             pingingIds = emptySet()
             pingingAll = false
