@@ -235,14 +235,6 @@ private fun AppTitleBar(darkTheme: Boolean, onToggleTheme: () -> Unit) {
             Text("PROXY CLIENT  ·  ANDROID", color = p.textMuted, fontSize = 8.5.sp, letterSpacing = 1.1.sp)
         }
         Spacer(Modifier.weight(1f))
-        IconButton(onClick = onToggleTheme, modifier = Modifier.size(42.dp)) {
-            Icon(
-                imageVector = if (darkTheme) Icons.Outlined.Security else Icons.Outlined.Info,
-                contentDescription = if (darkTheme) "Сменить тему" else "Сменить тему",
-                tint = p.textSecondary,
-                modifier = Modifier.size(20.dp),
-            )
-        }
     }
 }
 
@@ -893,8 +885,8 @@ private fun SettingsPage(
                 Text("ВНЕШНИЙ ВИД", color = p.textMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                 SettingToggleRow(
                     icon = if (viewModel.darkTheme) Icons.Outlined.DarkMode else Icons.Outlined.LightMode,
-                    title = "Тёмная тема Windows",
-                    description = "Палитра GoreBox для Windows и Android",
+                    title = "Тёмная тема приложения",
+                    description = "",
                     checked = viewModel.darkTheme,
                     onCheckedChange = viewModel::updateDarkTheme,
                 )
