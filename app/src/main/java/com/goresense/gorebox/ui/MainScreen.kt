@@ -999,7 +999,7 @@ private fun SettingsPage(
             Column(Modifier.padding(15.dp)) {
                 Text("ДИАГНОСТИКА", color = p.textMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                 Text(
-                    "Логи подключений и ошибок пишутся в файл. Отправьте их разработчику, если что-то не работает.",
+                    "Логи приложения и ядра прокси пишутся в файлы. Отправьте их разработчику, если что-то не работает.",
                     color = p.textMuted,
                     fontSize = 10.sp,
                     lineHeight = 14.sp,
@@ -1009,20 +1009,27 @@ private fun SettingsPage(
                     val context = LocalContext.current
                     SecondaryActionButton("Поделиться логами", Icons.Outlined.Share, {
                         AppLog.i("UI", "Пользователь отправил логи")
-                        val logFile = AppLog.file(context)
-                        if (!logFile.exists()) {
-                            Toast.makeText(context, "Лог-файл ещё не создан", Toast.LENGTH_SHORT).show()
+                        val logsDir = java.io.File(context.filesDir, "logs")
+                        val logFiles = listOf("gorebox.log", "core.log", "gorebox.log.old", "core.log.old")
+                            .map { name -> java.io.File(logsDir, name) }
+                            .filter { it.exists() && it.length() > 0 }
+                        if (logFiles.isEmpty()) {
+                            Toast.makeText(context, "Лог-файлы ещё не созданы", Toast.LENGTH_SHORT).show()
                             return@SecondaryActionButton
                         }
                         runCatching {
-                            val uri = FileProvider.getUriForFile(
-                                context,
-                                "${context.packageName}.fileprovider",
-                                logFile,
+                            val uris = ArrayList(
+                                logFiles.map { file ->
+                                    FileProvider.getUriForFile(
+                                        context,
+                                        "${context.packageName}.fileprovider",
+                                        file,
+                                    )
+                                },
                             )
-                            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                            val sendIntent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
                                 type = "text/plain"
-                                putExtra(Intent.EXTRA_STREAM, uri)
+                                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
                             context.startActivity(Intent.createChooser(sendIntent, "Отправить логи GoreBox"))
@@ -1069,7 +1076,9 @@ private fun SettingToggleRow(
         Icon(icon, contentDescription = null, tint = p.textSecondary, modifier = Modifier.size(18.dp))
         Column(Modifier.weight(1f).padding(start = 9.dp, end = 7.dp)) {
             Text(title, color = p.text, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-            Text(description, color = p.textMuted, fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp))
+            if (description.isNotBlank()) {
+                Text(description, color = p.textMuted, fontSize = 10.sp, modifier = Modifier.padding(top = 2.dp))
+            }
         }
         Switch(
             checked = checked,

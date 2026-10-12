@@ -68,7 +68,7 @@ object SingBoxConfigBuilder {
     ): JSONObject {
         proxy.put("tag", PROXY_TAG)
         val config = JSONObject()
-        config.put("log", JSONObject().put("level", "warn"))
+        config.put("log", JSONObject().put("level", "info").put("output", "logs/core.log").put("timestamp", true))
         config.put("inbounds", JSONArray().put(createTunInbound(packages, selectedAppsOnly, directPackages)))
         config.put(
             "outbounds",
@@ -129,6 +129,9 @@ object SingBoxConfigBuilder {
         // with EADDRNOTAVAIL. gVisor keeps the TCP/IP stack inside the process and avoids that.
         tun.put("stack", "gvisor")
         config.put("inbounds", inbounds)
+        if (!config.has("log")) {
+            config.put("log", JSONObject().put("level", "info").put("output", "logs/core.log").put("timestamp", true))
+        }
 
         val route = config.optJSONObject("route") ?: JSONObject()
         if (!route.has("final") || route.optString("final").isBlank()) {

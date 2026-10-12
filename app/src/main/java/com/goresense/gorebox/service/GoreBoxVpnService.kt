@@ -513,7 +513,10 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
 
     override fun writeLog(message: String?) {
         val line = message?.trim().orEmpty()
-        if (line.isNotEmpty()) Log.i(TAG, line)
+        if (line.isNotEmpty()) {
+            Log.i(TAG, line)
+            AppLog.i("Core", line)
+        }
     }
 
     override fun onRevoke() {
