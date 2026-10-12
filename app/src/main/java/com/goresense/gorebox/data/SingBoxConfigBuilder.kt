@@ -307,7 +307,7 @@ object SingBoxConfigBuilder {
                 query["obfs"]?.takeIf { it.isNotBlank() }?.let { outbound.put("obfs", it) }
                 query["ports"]?.takeIf { it.isNotBlank() }?.let { outbound.put("hop_ports", it) }
                 query["hop_interval"]?.toDurationSeconds()?.let { outbound.put("hop_interval", it) }
-                applyTls(outbound, query, host, force = true)
+                applyTls(outbound, query, host, force = true, allowUtls = false)
             }
             "hysteria2", "hy2" -> {
                 outbound.put("type", "hysteria2")
@@ -324,7 +324,7 @@ object SingBoxConfigBuilder {
                     outbound.put("hop_ports", ports)
                     query["hop_interval"]?.toDurationSeconds()?.let { outbound.put("hop_interval", it) }
                 }
-                applyTls(outbound, query, host, force = true)
+                applyTls(outbound, query, host, force = true, allowUtls = false)
             }
             "tuic" -> {
                 outbound.put("type", "tuic")
@@ -333,7 +333,7 @@ object SingBoxConfigBuilder {
                 query["congestion_control"]?.let { outbound.put("congestion_control", it) }
                 query["udp_relay_mode"]?.let { outbound.put("udp_relay_mode", it) }
                 query["zero_rtt_handshake"]?.toBooleanFlag()?.let { outbound.put("zero_rtt_handshake", it) }
-                applyTls(outbound, query, host, force = true, defaultAlpn = "h3")
+                applyTls(outbound, query, host, force = true, defaultAlpn = "h3", allowUtls = false)
             }
             "ssh" -> {
                 outbound.put("type", "ssh")
@@ -476,6 +476,7 @@ object SingBoxConfigBuilder {
         server: String,
         force: Boolean,
         defaultAlpn: String? = null,
+        allowUtls: Boolean = true,
     ) {
         val security = query["security"]?.lowercase().orEmpty()
         val realityEnabled = security == "reality" || query["pbk"] != null || query["publickey"] != null
@@ -488,7 +489,7 @@ object SingBoxConfigBuilder {
         val alpn = splitList(query["alpn"].orEmpty())
         if (alpn.length() > 0) tls.put("alpn", alpn)
         val fingerprint = query.firstOf("fp", "fingerprint")
-        if (!fingerprint.isNullOrBlank()) {
+        if (allowUtls && !fingerprint.isNullOrBlank()) {
             tls.put("utls", JSONObject().put("enabled", true).put("fingerprint", fingerprint))
         }
         if (realityEnabled) {

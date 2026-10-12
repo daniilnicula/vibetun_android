@@ -302,29 +302,34 @@ private fun ProfilesPage(
         PageHeading(
             title = "Профили",
             subtitle = "Серверы и конфигурации GoreBox",
-            trailing = {
-                SmallActionButton(
-                    label = "Импорт",
-                    icon = Icons.Outlined.FileOpen,
-                    onClick = onOpenImport,
-                )
-            },
         )
         ConnectionCard(viewModel = viewModel, onConnect = onConnect)
 
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("СОХРАНЁННЫЕ ПРОФИЛИ", color = p.textMuted, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.05.sp)
-                Text("${viewModel.profiles.size} ${profileCountWord(viewModel.profiles.size)}", color = p.textSecondary, fontSize = 12.sp, modifier = Modifier.padding(top = 3.dp))
-            }
+        Text(
+            "СОХРАНЁННЫЕ ПРОФИЛИ",
+            color = p.textMuted,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.05.sp,
+            modifier = Modifier.padding(top = 14.dp),
+        )
+        Text(
+            "${viewModel.profiles.size} ${profileCountWord(viewModel.profiles.size)}",
+            color = p.textSecondary,
+            fontSize = 12.sp,
+            modifier = Modifier.padding(top = 3.dp),
+        )
+        Row(
+            Modifier.fillMaxWidth().padding(top = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+        ) {
             SmallActionButton(
                 label = if (viewModel.pingingAll) "Пинг…" else "Ping all",
                 icon = Icons.Outlined.NetworkPing,
                 onClick = { viewModel.pingAll() },
             )
-            Spacer(Modifier.width(7.dp))
             SmallActionButton(label = "Вставить", icon = Icons.Outlined.ContentPaste, onClick = onPaste)
-            Spacer(Modifier.width(7.dp))
+            SmallActionButton(label = "Импорт", icon = Icons.Outlined.FileOpen, onClick = onOpenImport)
             AddButton(onClick = onAddManual)
         }
         Spacer(Modifier.height(10.dp))
