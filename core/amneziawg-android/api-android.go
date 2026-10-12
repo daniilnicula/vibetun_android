@@ -162,6 +162,19 @@ func awgGetSocketV6(tunnelHandle int32) int32 {
 	return int32(fd)
 }
 
+//export awgGetStats
+func awgGetStats(tunnelHandle int32) *C.char {
+	handle, ok := tunnelHandles[tunnelHandle]
+	if !ok {
+		return C.CString("")
+	}
+	builder := new(strings.Builder)
+	if err := handle.device.IpcGet(builder); err != nil {
+		return C.CString("")
+	}
+	return C.CString(builder.String())
+}
+
 //export awgVersion
 func awgVersion() *C.char {
 	info, ok := debug.ReadBuildInfo()

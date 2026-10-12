@@ -10,9 +10,13 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.IpPrefix
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.system.OsConstants
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -57,6 +61,8 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     @Volatile private var boxService: BoxService? = null
     @Volatile private var amneziaHandle: Int = NO_AMNEZIA_HANDLE
     @Volatile private var tunDescriptor: ParcelFileDescriptor? = null
+    @Volatile private var lastStoppedAtMs: Long = 0L
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val endpointResolver = Executors.newSingleThreadExecutor { task ->
         Thread(task, "GoreBox-AWG-DNS").apply { isDaemon = true }
     }
@@ -65,11 +71,26 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         AppLog.i(TAG, "onStartCommand action=${intent?.action ?: ACTION_START}")
         when (intent?.action ?: ACTION_START) {
             ACTION_STOP -> stopConnection()
-            ACTION_TOGGLE -> if (isProxyActive()) stopConnection() else startConnection()
-            ACTION_START -> startConnection()
+            ACTION_TOGGLE -> if (isProxyActive()) stopConnection() else scheduleStart()
+            ACTION_START -> scheduleStart()
             else -> stopSelf(startId)
         }
         return START_STICKY
+    }
+
+    /**
+     * Нативное ядро падает, если стартовать сразу после остановки (teardown ещё идёт).
+     * Даём короткую паузу и только затем запускаем подключение.
+     */
+    private fun scheduleStart() {
+        if (isProxyActive()) return
+        val waitMs = SETTLE_DELAY_MS - (SystemClock.elapsedRealtime() - lastStoppedAtMs)
+        if (waitMs > 0) {
+            AppLog.i(TAG, "Пауза ${waitMs}мс после остановки перед стартом")
+            mainHandler.postDelayed({ startConnection() }, waitMs)
+        } else {
+            startConnection()
+        }
     }
 
     private fun startConnection() {
@@ -126,14 +147,23 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
             routeRules = RouteSetStore(this).load(activeRouteSet()),
         )
         val basePath = filesDir.absolutePath
-        AppLog.i(TAG, "startSingBox: Libbox.setup(basePath=$basePath)")
-        Libbox.setup(basePath, basePath, cacheDir.absolutePath, false)
+        ensureLibboxReady(basePath)
         AppLog.i(TAG, "startSingBox: Libbox.newService…")
         val service = Libbox.newService(config, this)
         boxService = service
         AppLog.i(TAG, "startSingBox: service.start()…")
         service.start()
         AppLog.i(TAG, "startSingBox: service.start() завершён")
+    }
+
+    private fun ensureLibboxReady(basePath: String) {
+        if (libboxReady) return
+        synchronized(GoreBoxVpnService::class.java) {
+            if (libboxReady) return
+            AppLog.i(TAG, "startSingBox: Libbox.setup(basePath=$basePath, однократно)")
+            Libbox.setup(basePath, basePath, cacheDir.absolutePath, false)
+            libboxReady = true
+        }
     }
 
     private fun activeRouteSet(): String {
@@ -192,6 +222,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         val handle = AmneziaGoBackend.awgTurnOn("gorebox-awg", nativeFd, userspaceConfig)
         check(handle >= 0) { "Не удалось запустить AmneziaWG. Проверьте ключи, endpoint и параметры конфигурации." }
         amneziaHandle = handle
+        scheduleAwgDiagnostics(handle)
 
         val socketFds = listOf(
             AmneziaGoBackend.awgGetSocketV4(handle),
@@ -203,6 +234,22 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         }
         Log.i(TAG, "AmneziaWG ${AmneziaGoBackend.awgVersion()} started for profile ${profile.id}")
         AppLog.i(TAG, "startAmneziaWg: запущено (${AmneziaGoBackend.awgVersion()})")
+    }
+
+    /** Диагностика AmneziaWG: снимаем UAPI-статистику через 6 и 20 секунд после старта. */
+    private fun scheduleAwgDiagnostics(handle: Int) {
+        listOf(6_000L, 20_000L).forEach { delayMs ->
+            mainHandler.postDelayed({
+                if (amneziaHandle != handle) return@postDelayed
+                runCatching {
+                    val dump = AmneziaGoBackend.awgGetStats(handle)
+                    val sanitized = dump.lines()
+                        .filterNot { it.startsWith("private_key=") || it.startsWith("preshared_key=") }
+                        .joinToString("\n")
+                    AppLog.i(TAG, "AWG статистика через ${delayMs / 1000}с:\n$sanitized")
+                }.onFailure { AppLog.e(TAG, "AWG: не удалось получить статистику", it) }
+            }, delayMs)
+        }
     }
 
     private fun parseIpPrefix(cidr: String): Pair<InetAddress, Int> {
@@ -275,20 +322,24 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
 
     private fun fail(message: String) {
         AppLog.e(TAG, "fail: $message")
+        mainHandler.removeCallbacksAndMessages(null)
         stateStore.update(ConnectionState.ERROR, message)
         profileStore.proxyWasActive = false
         closeNativeService()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        lastStoppedAtMs = SystemClock.elapsedRealtime()
     }
 
     private fun stopConnection() {
         AppLog.i(TAG, "stopConnection")
+        mainHandler.removeCallbacksAndMessages(null)
         closeNativeService()
         profileStore.proxyWasActive = false
         stateStore.update(ConnectionState.STOPPED)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        lastStoppedAtMs = SystemClock.elapsedRealtime()
     }
 
     private fun closeNativeService() {
@@ -473,6 +524,15 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         network: Network,
         knownInterfaceName: String? = null,
     ) {
+        // Собственный VPN-интерфейс (TRANSPORT_VPN) нельзя публиковать как default:
+        // иначе outbound ядра привяжется к tun0 и весь трафик зависнет в петле.
+        // Сбрасываем default, чтобы ядро не держало ранее опубликованный tun0.
+        val capabilities = connectivity.getNetworkCapabilities(network)
+        if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
+            AppLog.i(TAG, "publishDefaultNetwork: пропуск собственного VPN-интерфейса")
+            listener.updateDefaultInterface("", -1)
+            return
+        }
         val name = knownInterfaceName ?: connectivity.getLinkProperties(network)?.interfaceName.orEmpty()
         val index = if (name.isBlank()) -1 else runCatching { JavaNetworkInterface.getByName(name)?.index ?: -1 }.getOrDefault(-1)
         listener.updateDefaultInterface(name, index)
@@ -526,6 +586,8 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
 
     override fun onDestroy() {
         AppLog.i(TAG, "onDestroy")
+        mainHandler.removeCallbacksAndMessages(null)
+        lastStoppedAtMs = SystemClock.elapsedRealtime()
         interfaceCallbacks.values.toList().forEach { callback ->
             runCatching { connectivity.unregisterNetworkCallback(callback) }
         }
@@ -587,7 +649,12 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         private const val CHANNEL_ID = "gorebox_proxy"
         private const val NOTIFICATION_ID = 4201
         private const val NO_AMNEZIA_HANDLE = -1
+        private const val SETTLE_DELAY_MS = 2500L
         private val IPV4_PATTERN = Regex("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$")
         private const val TAG = "GoreBoxVpnService"
+
+        /** Libbox.setup допустим только один раз за жизнь процесса — повторные вызовы роняли нативный код. */
+        @Volatile
+        private var libboxReady: Boolean = false
     }
 }

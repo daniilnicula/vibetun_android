@@ -13,5 +13,6 @@ public final class GoBackend {
     public static native void awgTurnOff(int tunnelHandle);
     public static native int awgGetSocketV4(int tunnelHandle);
     public static native int awgGetSocketV6(int tunnelHandle);
+    public static native String awgGetStats(int tunnelHandle);
     public static native String awgVersion();
 }
