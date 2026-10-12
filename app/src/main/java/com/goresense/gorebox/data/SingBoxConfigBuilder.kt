@@ -104,7 +104,9 @@ object SingBoxConfigBuilder {
                 .put("servers", createDnsServers(hasDirectDomains(routeRules)))
                 .put("rules", createDnsRules(routeRules))
                 .put("final", DNS_TAG)
-                .put("strategy", "prefer_ipv4"),
+                // IPv4-only: серверы в основном IPv4, AAAA-ответы заворачивают приложения
+                // на IPv6-адреса, которые через туннель не достижимы (YouTube вис).
+                .put("strategy", "ipv4_only"),
         )
         return config
     }
@@ -141,7 +143,7 @@ object SingBoxConfigBuilder {
             tun.put("auto_route", true)
             tun.put("strict_route", true)
             if (!tun.has("inet4_address")) tun.put("inet4_address", JSONArray().put("172.19.0.1/30"))
-            if (!tun.has("inet6_address")) tun.put("inet6_address", JSONArray().put("fd00:676f:7265::1/126"))
+            // IPv4-only: inet6_address не добавляем — AAAA-трафик через IPv4-only серверы виснет
             if (selectedAppsOnly) tun.put("include_package", JSONArray(packages))
             if (directPackages.isNotEmpty()) tun.put("exclude_package", JSONArray(directPackages))
         }
@@ -248,7 +250,6 @@ object SingBoxConfigBuilder {
             .put("type", "tun")
             .put("tag", TUN_TAG)
             .put("inet4_address", JSONArray().put("172.19.0.1/30"))
-            .put("inet6_address", JSONArray().put("fd00:676f:7265::1/126"))
             .put("mtu", 1500)
             .put("auto_route", true)
             .put("strict_route", true)

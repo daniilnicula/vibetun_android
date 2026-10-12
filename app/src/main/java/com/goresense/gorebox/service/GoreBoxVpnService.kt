@@ -222,7 +222,9 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
 
         var hasIpv4DefaultRoute = false
         var hasIpv6DefaultRoute = false
-        config.peerAllowedIps().forEach { cidr ->
+        // IPv6-маршруты пропускаем: серверы IPv4-only, AAAA-трафик через туннель
+        // зависает (YouTube). Туннель становится IPv4-only, приложения идут по v4.
+        config.peerAllowedIps().filterNot { it.contains(':') }.forEach { cidr ->
             val (address, prefix) = parseIpPrefix(cidr)
             builder.addRoute(address, prefix)
             if (prefix == 0 && address is Inet4Address) hasIpv4DefaultRoute = true
