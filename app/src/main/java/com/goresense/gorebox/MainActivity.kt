@@ -154,6 +154,9 @@ class MainActivity : ComponentActivity() {
             registerReceiver(stateReceiver, filter)
         }
         stateReceiverRegistered = true
+        // Пока Activity была остановлена, broadcast'ы состояния могли быть пропущены —
+        // подтягиваем актуальное состояние из файла (свежее, чем prefs кросс-процессно).
+        viewModel.refreshConnectionState()
     }
 
     override fun onStop() {

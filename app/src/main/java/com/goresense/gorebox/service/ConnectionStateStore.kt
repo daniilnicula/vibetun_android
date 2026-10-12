@@ -5,19 +5,37 @@ import android.content.Context
 import android.content.Intent
 import android.service.quicksettings.TileService
 import com.goresense.gorebox.data.ConnectionState
+import java.io.File
 
+/**
+ * Состояние соединения. Основное хранилище — маленький файл с атомарной записью
+ * (tmp + rename): SharedPreferences кэшируются per-process, поэтому между процессами
+ * (UI и :vpn) prefs протухают, а файл всегда читается с диска. Broadcast по-прежнему
+ * служит для мгновенных обновлений UI, prefs оставлены как запасной вариант.
+ */
 class ConnectionStateStore(context: Context) {
     private val appContext = context.applicationContext
     private val prefs = appContext.getSharedPreferences("gorebox_connection", Context.MODE_PRIVATE)
 
+    private val stateFile: File get() = File(appContext.filesDir, "connection_state.txt")
+
     val state: ConnectionState
-        get() = runCatching { ConnectionState.valueOf(prefs.getString(KEY_STATE, null) ?: "STOPPED") }
-            .getOrDefault(ConnectionState.STOPPED)
+        get() = readFromFile()?.first
+            ?: runCatching { ConnectionState.valueOf(prefs.getString(KEY_STATE, null) ?: "STOPPED") }
+                .getOrDefault(ConnectionState.STOPPED)
 
     val message: String
-        get() = prefs.getString(KEY_MESSAGE, "").orEmpty()
+        get() = readFromFile()?.second ?: prefs.getString(KEY_MESSAGE, "").orEmpty()
 
     fun update(state: ConnectionState, message: String = "") {
+        runCatching {
+            val tmp = File(stateFile.parentFile, stateFile.name + ".tmp")
+            tmp.writeText(state.name + "\n" + message)
+            if (!tmp.renameTo(stateFile)) {
+                stateFile.delete()
+                tmp.renameTo(stateFile)
+            }
+        }
         prefs.edit()
             .putString(KEY_STATE, state.name)
             .putString(KEY_MESSAGE, message)
@@ -34,6 +52,13 @@ class ConnectionStateStore(context: Context) {
             )
         }
     }
+
+    private fun readFromFile(): Pair<ConnectionState, String>? = runCatching {
+        if (!stateFile.isFile) return@runCatching null
+        val lines = stateFile.readLines()
+        val parsedState = ConnectionState.valueOf(lines.firstOrNull().orEmpty())
+        parsedState to lines.drop(1).joinToString("\n")
+    }.getOrNull()
 
     companion object {
         const val ACTION_STATE_CHANGED = "com.goresense.gorebox.CONNECTION_STATE_CHANGED"

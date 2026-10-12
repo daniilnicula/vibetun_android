@@ -73,7 +73,16 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         when (intent?.action ?: ACTION_START) {
             ACTION_STOP -> stopConnection()
             ACTION_TOGGLE -> if (isProxyActive()) stopConnection() else scheduleStart()
-            ACTION_START -> scheduleStart()
+            ACTION_START -> {
+                // Явный старт при активном подключении = пользователь сменил профиль.
+                // Раньше старт молча проглатывался (isProxyActive -> return), UI вис в
+                // «Подключаемся…», а старый туннель продолжал работать.
+                if (isProxyActive()) {
+                    AppLog.i(TAG, "ACTION_START при активном подключении — перезапуск с выбранным профилем")
+                    stopConnection()
+                }
+                scheduleStart()
+            }
             else -> stopSelf(startId)
         }
         return START_STICKY

@@ -14,6 +14,16 @@ object SingBoxConfigBuilder {
     private const val DNS_TAG = "gorebox-dns"
     private const val DIRECT_TAG = "gorebox-direct"
     private const val DNS_DIRECT_TAG = "gorebox-dns-direct"
+    private const val BLOCK_TAG = "gorebox-block"
+
+    /** QUIC (HTTP/3, UDP/443) через прокси-туннель нестабилен (QUIC-over-QUIC глохнет:
+     *  YouTube грузит Telegram-подобные TCP-сервисы, но не видео). Блокируем UDP/443,
+     *  клиенты откатываются на TCP/TLS. */
+    private fun quicBlockRule(): JSONObject =
+        JSONObject().put("network", "udp").put("port", 443).put("outbound", BLOCK_TAG)
+
+    private fun blockOutbound(): JSONObject =
+        JSONObject().put("type", "block").put("tag", BLOCK_TAG)
 
     fun build(
         profile: ProxyProfile,
@@ -74,13 +84,18 @@ object SingBoxConfigBuilder {
             "outbounds",
             JSONArray()
                 .put(proxy)
-                .put(JSONObject().put("type", "direct").put("tag", "gorebox-direct")),
+                .put(JSONObject().put("type", "direct").put("tag", "gorebox-direct"))
+                .put(blockOutbound()),
         )
         config.put(
             "route",
             JSONObject()
                 .put("auto_detect_interface", true)
-                .put("rules", createRouteRules(routeRules))
+                .put("rules", JSONArray().put(quicBlockRule()).let { rules ->
+                    val userRules = createRouteRules(routeRules)
+                    for (index in 0 until userRules.length()) rules.put(userRules.getJSONObject(index))
+                    rules
+                })
                 .put("final", PROXY_TAG),
         )
         config.put(
@@ -104,6 +119,11 @@ object SingBoxConfigBuilder {
         val outbounds = config.optJSONArray("outbounds")
             ?: throw IllegalArgumentException("В конфигурации отсутствует массив outbounds.")
         require(outbounds.length() > 0) { "В конфигурации нет исходящих подключений (outbounds)." }
+        val hasBlockOutbound = (0 until outbounds.length())
+            .asSequence()
+            .mapNotNull { outbounds.optJSONObject(it) }
+            .any { it.optString("type") == "block" }
+        if (!hasBlockOutbound) outbounds.put(blockOutbound())
 
         var tun: JSONObject? = null
         val inbounds = config.optJSONArray("inbounds") ?: JSONArray()
@@ -147,11 +167,18 @@ object SingBoxConfigBuilder {
             route.put("final", proxyTag)
         }
         route.put("auto_detect_interface", true)
+        // QUIC-блок должен быть первым правилом и в полносвязных конфигах
+        val existingRules = route.optJSONArray("rules") ?: JSONArray()
+        val hasQuicBlock = (0 until existingRules.length())
+            .asSequence()
+            .mapNotNull { existingRules.optJSONObject(it) }
+            .any { it.optString("network") == "udp" && it.optInt("port") == 443 }
+        val mergedRules = JSONArray()
+        if (!hasQuicBlock) mergedRules.put(quicBlockRule())
         val userRules = createRouteRules(routeRules)
-        for (index in userRules.length() - 1 downTo 0) {
-            route.optJSONArray("rules")?.put(0, userRules.getJSONObject(index))
-        }
-        if (route.optJSONArray("rules") == null && userRules.length() > 0) route.put("rules", userRules)
+        for (index in 0 until userRules.length()) mergedRules.put(userRules.getJSONObject(index))
+        for (index in 0 until existingRules.length()) mergedRules.put(existingRules.getJSONObject(index))
+        route.put("rules", mergedRules)
         config.put("route", route)
         return config
     }
