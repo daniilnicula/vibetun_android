@@ -19,8 +19,8 @@ object LatencyTester {
             try {
                 Socket().use { socket ->
                     socket.connect(InetSocketAddress(host, port), timeoutMs)
-                    val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
-                    if (elapsed >= 0 && (best == null || elapsed < best!!)) best = elapsed
+                    val elapsed = maxOf(1L, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started))
+                    if (best == null || elapsed < best!!) best = elapsed
                 }
             } catch (_: Exception) {
                 // попытка не считается: сервер/порт недоступны

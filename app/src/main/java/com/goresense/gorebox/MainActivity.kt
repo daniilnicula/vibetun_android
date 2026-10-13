@@ -203,6 +203,11 @@ class MainActivity : ComponentActivity() {
 
     private fun requestService(action: String) {
         val serviceIntent = Intent(this, GoreBoxVpnService::class.java).setAction(action)
+        if (action == GoreBoxVpnService.ACTION_START) {
+            // Профиль передаём явно: даже с MODE_MULTI_PROCESS prefs надёжнее не гонять
+            // через межпроцессный кэш.
+            serviceIntent.putExtra(GoreBoxVpnService.EXTRA_PROFILE_ID, viewModel.selectedProfileId)
+        }
         if (action == GoreBoxVpnService.ACTION_STOP) {
             startService(serviceIntent)
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

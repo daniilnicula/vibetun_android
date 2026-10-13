@@ -16,10 +16,9 @@ object SingBoxConfigBuilder {
     private const val DNS_DIRECT_TAG = "gorebox-dns-direct"
     private const val BLOCK_TAG = "gorebox-block"
 
-    /** Отключено: Hiddify QUIC не блокирует, и YouTube у него работает — вероятно,
-     *  после фикса uTLS QUIC через туннель штатно работает, а блокировка UDP/443
-     *  только мешает откату YouTube на TCP. Правило оставлено на случай возврата. */
-    @Suppress("unused")
+    /** QUIC (UDP/443) блокируем: у нашего ядра (форк NekoBox) QUIC-relay через
+     *  туннель на части серверов мёртв — без блокировки браузеры не откатываются
+     *  на TCP и ничего не грузят. TCP-fallback работает предсказуемо. */
     private fun quicBlockRule(): JSONObject =
         JSONObject().put("network", "udp").put("port", 443).put("outbound", BLOCK_TAG)
 
@@ -217,8 +216,10 @@ object SingBoxConfigBuilder {
         return config
     }
 
-    /** Правила маршрутизации: DIRECT-значения уходят в gorebox-direct, остальное решает final. */
+    /** Правила маршрутизации: QUIC блокируем первым правилом, DIRECT-значения
+     *  уходят в gorebox-direct, остальное решает final. */
     private fun createRouteRules(rules: List<RouteRule>): JSONArray {
+        val merged = JSONArray().put(quicBlockRule())
         val direct = rules.filter { it.action == RouteAction.DIRECT }
         fun valuesOf(type: RouteRuleType): JSONArray = JSONArray().apply {
             direct.filter { it.type == type }.forEach { rule ->
@@ -235,7 +236,8 @@ object SingBoxConfigBuilder {
         if (suffix.length() > 0) result.put(JSONObject().put("domain_suffix", suffix).put("outbound", DIRECT_TAG))
         if (keyword.length() > 0) result.put(JSONObject().put("domain_regex", keyword).put("outbound", DIRECT_TAG))
         if (cidr.length() > 0) result.put(JSONObject().put("ip_cidr", cidr).put("outbound", DIRECT_TAG))
-        return result
+        for (index in 0 until result.length()) merged.put(result.getJSONObject(index))
+        return merged
     }
 
     private fun createDnsServers(hasDirectDomains: Boolean): JSONArray = JSONArray().apply {

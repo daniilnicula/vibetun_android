@@ -86,6 +86,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
                     AppLog.i(TAG, "ACTION_START при активном подключении — перезапуск с выбранным профилем")
                     stopConnection()
                 }
+                requestedProfileId = intent?.getStringExtra(EXTRA_PROFILE_ID)?.takeIf { it.isNotBlank() }
                 scheduleStart()
             }
             else -> stopSelf(startId)
@@ -368,8 +369,11 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     private fun isProxyActive(): Boolean = boxService != null || amneziaHandle != NO_AMNEZIA_HANDLE
 
     private fun loadSelectedProfile(): ProxyProfile {
-        val selectedId = profileStore.selectedProfileId
-        return profileStore.loadProfiles().firstOrNull { it.id == selectedId }
+        val requested = requestedProfileId
+        requestedProfileId = null
+        val profiles = profileStore.loadProfiles()
+        val selectedId = requested ?: profileStore.selectedProfileId
+        return profiles.firstOrNull { it.id == selectedId }
             ?: throw IllegalStateException("Профиль не найден. Откройте GoreBox и выберите профиль.")
     }
 
@@ -713,6 +717,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         const val ACTION_START = "com.goresense.gorebox.action.START"
         const val ACTION_STOP = "com.goresense.gorebox.action.STOP"
         const val ACTION_TOGGLE = "com.goresense.gorebox.action.TOGGLE"
+        const val EXTRA_PROFILE_ID = "com.goresense.gorebox.extra.PROFILE_ID"
         private const val CHANNEL_ID = "gorebox_proxy"
         private const val NOTIFICATION_ID = 4201
         private const val NO_AMNEZIA_HANDLE = -1
@@ -735,5 +740,9 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         @Volatile
         var instance: GoreBoxVpnService? = null
             private set
+
+        /** Профиль из последнего ACTION_START (передаётся явно, надёжнее prefs между процессами). */
+        @Volatile
+        private var requestedProfileId: String? = null
     }
 }

@@ -5,8 +5,12 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /** Small private on-device store; profile credentials never leave the app. */
+@Suppress("DEPRECATION")
 class GoreBoxStore(context: Context) {
-    private val preferences = context.applicationContext.getSharedPreferences("gorebox", Context.MODE_PRIVATE)
+    // MODE_MULTI_PROCESS: сервис живёт в процессе :vpn, а SharedPreferences кэшируются
+    // per-process — без этого флага сервис видит протухший снапшот (профили, выбор,
+    // списки приложений). Записи редкие, флага достаточно.
+    private val preferences = context.applicationContext.getSharedPreferences("gorebox", Context.MODE_MULTI_PROCESS)
 
     fun loadProfiles(): List<ProxyProfile> {
         val raw = preferences.getString(KEY_PROFILES, "[]") ?: "[]"
