@@ -16,9 +16,10 @@ object SingBoxConfigBuilder {
     private const val DNS_DIRECT_TAG = "gorebox-dns-direct"
     private const val BLOCK_TAG = "gorebox-block"
 
-    /** QUIC (HTTP/3, UDP/443) через прокси-туннель нестабилен (QUIC-over-QUIC глохнет:
-     *  YouTube грузит Telegram-подобные TCP-сервисы, но не видео). Блокируем UDP/443,
-     *  клиенты откатываются на TCP/TLS. */
+    /** Отключено: Hiddify QUIC не блокирует, и YouTube у него работает — вероятно,
+     *  после фикса uTLS QUIC через туннель штатно работает, а блокировка UDP/443
+     *  только мешает откату YouTube на TCP. Правило оставлено на случай возврата. */
+    @Suppress("unused")
     private fun quicBlockRule(): JSONObject =
         JSONObject().put("network", "udp").put("port", 443).put("outbound", BLOCK_TAG)
 
@@ -117,7 +118,9 @@ object SingBoxConfigBuilder {
     ): JSONObject {
         proxy.put("tag", PROXY_TAG)
         val config = JSONObject()
-        config.put("log", JSONObject().put("level", "info").put("output", "logs/core.log").put("timestamp", true))
+        // debug в файле ядра: нужен для диагностики обрывов (DNS, закрытия соединений).
+        // В AppLog/logcat debug-строки не попадают (фильтр в writeLog).
+        config.put("log", JSONObject().put("level", "debug").put("output", "logs/core.log").put("timestamp", true))
         config.put("inbounds", JSONArray().put(createTunInbound(packages, selectedAppsOnly, directPackages)))
         config.put(
             "outbounds",
@@ -130,11 +133,7 @@ object SingBoxConfigBuilder {
             "route",
             JSONObject()
                 .put("auto_detect_interface", true)
-                .put("rules", JSONArray().put(quicBlockRule()).let { rules ->
-                    val userRules = createRouteRules(routeRules)
-                    for (index in 0 until userRules.length()) rules.put(userRules.getJSONObject(index))
-                    rules
-                })
+                .put("rules", createRouteRules(routeRules))
                 .put("final", PROXY_TAG),
         )
         config.put(
@@ -208,18 +207,12 @@ object SingBoxConfigBuilder {
             route.put("final", proxyTag)
         }
         route.put("auto_detect_interface", true)
-        // QUIC-блок должен быть первым правилом и в полносвязных конфигах
-        val existingRules = route.optJSONArray("rules") ?: JSONArray()
-        val hasQuicBlock = (0 until existingRules.length())
-            .asSequence()
-            .mapNotNull { existingRules.optJSONObject(it) }
-            .any { it.optString("network") == "udp" && it.optInt("port") == 443 }
-        val mergedRules = JSONArray()
-        if (!hasQuicBlock) mergedRules.put(quicBlockRule())
         val userRules = createRouteRules(routeRules)
+        val existingRules = route.optJSONArray("rules") ?: JSONArray()
+        val mergedRules = JSONArray()
         for (index in 0 until userRules.length()) mergedRules.put(userRules.getJSONObject(index))
         for (index in 0 until existingRules.length()) mergedRules.put(existingRules.getJSONObject(index))
-        route.put("rules", mergedRules)
+        if (mergedRules.length() > 0) route.put("rules", mergedRules)
         config.put("route", route)
         return config
     }

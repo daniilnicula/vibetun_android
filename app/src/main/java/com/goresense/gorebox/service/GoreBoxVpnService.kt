@@ -636,10 +636,13 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
 
     override fun writeLog(message: String?) {
         val line = message?.trim().orEmpty()
-        if (line.isNotEmpty()) {
-            Log.i(TAG, line)
-            AppLog.i("Core", line)
-        }
+        if (line.isEmpty()) return
+        // debug/trace уровни — только в файл ядра (logs/core.log), иначе AppLog превратится в кашу.
+        // Уровень приходит с ANSI-кодами вида «[36mINFO[0m[0000]», поэтому сначала снимаем их.
+        val plain = line.replace(Regex("\[[;\d]*m"), "")
+        if (plain.startsWith("DEBUG") || plain.startsWith("TRACE")) return
+        Log.i(TAG, plain)
+        AppLog.i("Core", plain)
     }
 
     override fun onRevoke() {
