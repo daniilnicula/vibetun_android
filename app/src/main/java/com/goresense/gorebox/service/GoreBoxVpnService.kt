@@ -639,8 +639,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         if (line.isEmpty()) return
         // debug/trace уровни — только в файл ядра (logs/core.log), иначе AppLog превратится в кашу.
         // Уровень приходит с ANSI-кодами вида «[36mINFO[0m[0000]», поэтому сначала снимаем их.
-        val plain = line.replace(Regex("\[[;\d]*m"), "")
-        if (plain.startsWith("DEBUG") || plain.startsWith("TRACE")) return
+        val plain = line.replace(Regex("\u001B\\[[;\\d]*m"), "") return
         Log.i(TAG, plain)
         AppLog.i("Core", plain)
     }
