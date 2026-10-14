@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 package org.amnezia.awg;
 
-/** Minimal JNI surface for the AmneziaWG userspace engine embedded in GoreBox. */
+/** Minimal JNI surface for the AmneziaWG userspace engine embedded in VibeTun. */
 public final class GoBackend {
     static {
         System.loadLibrary("wg-go");

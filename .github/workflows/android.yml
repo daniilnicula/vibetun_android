@@ -117,7 +117,7 @@ jobs:
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: GoreBox-debug-apk
+          name: VibeTun-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
@@ -146,9 +146,9 @@ jobs:
           from pathlib import Path
           from zipfile import ZIP_DEFLATED, ZipFile
           apk = Path('app/build/outputs/apk/debug/app-debug.apk')
-          archive = Path('deliverables/GoreBox-debug-apk.zip')
+          archive = Path('deliverables/VibeTun-debug-apk.zip')
           with ZipFile(archive, 'w', compression=ZIP_DEFLATED, compresslevel=9) as output:
-              output.write(apk, arcname='GoreBox-debug.apk')
+              output.write(apk, arcname='VibeTun-debug.apk')
           size = archive.stat().st_size
           print(f'Compressed APK archive: {size} bytes')
           if size >= 100_000_000:
@@ -156,10 +156,10 @@ jobs:
           PY
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add deliverables/GoreBox-debug-apk.zip
+          git add deliverables/VibeTun-debug-apk.zip
           if git diff --cached --quiet; then
             echo "The branch already contains the current APK archive."
           else
-            git commit -m "Add compressed downloadable GoreBox debug APK"
+            git commit -m "Add compressed downloadable VibeTun debug APK"
             git push origin HEAD:refs/heads/main
           fi

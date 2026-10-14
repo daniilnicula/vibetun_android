@@ -1,5 +1,5 @@
 <resources>
-    <style name="Theme.GoreBox" parent="android:Theme.Material.NoActionBar">
+    <style name="Theme.VibeTun" parent="android:Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
         <item name="android:colorAccent">#5C96FF</item>
         <item name="android:windowLightStatusBar">false</item>

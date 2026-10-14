@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "GoreBox"
+rootProject.name = "VibeTun"
 include(":app")

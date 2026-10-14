@@ -20,12 +20,12 @@
     </queries>
 
     <application
-        android:name=".GoreBoxApp"
+        android:name=".VibeTunApp"
         android:allowBackup="false"
-        android:icon="@drawable/ic_gorebox"
+        android:icon="@drawable/ic_vibetun"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.GoreBox">
+        android:theme="@style/Theme.VibeTun">
 
         <activity
             android:name=".MainActivity"
@@ -44,7 +44,7 @@
         </activity>
 
         <service
-            android:name=".service.GoreBoxVpnService"
+            android:name=".service.VibeTunVpnService"
             android:exported="true"
             android:foregroundServiceType="systemExempted"
             android:process=":vpn"
@@ -56,7 +56,7 @@
 
         <!-- AmneziaWG (libwg-go) и sing-box (libbox) — разные Go-runtime: каждому свой процесс. -->
         <service
-            android:name=".service.GoreBoxAwgVpnService"
+            android:name=".service.VibeTunAwgVpnService"
             android:exported="true"
             android:foregroundServiceType="systemExempted"
             android:process=":vpn_awg"
@@ -71,9 +71,9 @@
         </receiver>
 
         <service
-            android:name=".service.GoreBoxTileService"
+            android:name=".service.VibeTunTileService"
             android:exported="true"
-            android:icon="@drawable/ic_tile_gorebox"
+            android:icon="@drawable/ic_tile_vibetun"
             android:label="@string/quick_tile_name"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>

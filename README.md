@@ -1,14 +1,14 @@
-# GoreBox Android
+# VibeTun Android
 
-Android-клиент GoreBox с интерфейсом в палитре и визуальном стиле Windows-версии: [daniilnicula/gorebox_win](https://github.com/daniilnicula/gorebox_win). Приложение использует тот же sing-box-код из дерева Windows-версии, собранный в Android `libbox.aar`, и Android `VpnService`/TUN для маршрутизации трафика.
+Android-клиент VibeTun с интерфейсом в палитре и визуальном стиле Windows-версии: [daniilnicula/vibetun_win](https://github.com/daniilnicula/vibetun_win). Приложение использует тот же sing-box-код из дерева Windows-версии, собранный в Android `libbox.aar`, и Android `VpnService`/TUN для маршрутизации трафика.
 
 ## Реализация
 
 - Kotlin + Jetpack Compose, локальное хранение профилей, импорт ссылок и JSON, экран маршрутов, светлая/тёмная тема.
 - sing-box `1.9.7-neko-1` собирается через gomobile для Android; исходники ядра лежат в `core/sing-box/` и `core/sing-quic/`. AmneziaWG запускается отдельным встроенным userspace-движком `amneziawg-go` через тот же Android `VpnService`.
-- `GoreBoxVpnService` реализует `PlatformInterface`: создаёт TUN через `VpnService.Builder`, защищает исходящие сокеты через `VpnService.protect()`, следит за сменой сети и передаёт lifecycle ядру. Для TUN используется gVisor-stack, чтобы не привязывать системные сокеты Android к виртуальному IPv6-адресу.
-- Режим выбранных приложений использует `include_package` sing-box и `Builder.addAllowedApplication()`. Сам GoreBox исключается из списка VPN-приложений, чтобы служба могла устанавливать прокси-соединения.
-- Quick Settings-плитка GoreBox: короткое нажатие переключает VPN; если ещё нет профиля или разрешения Android, открывает приложение для настройки. Удержание плитки открывает GoreBox.
+- `VibeTunVpnService` реализует `PlatformInterface`: создаёт TUN через `VpnService.Builder`, защищает исходящие сокеты через `VpnService.protect()`, следит за сменой сети и передаёт lifecycle ядру. Для TUN используется gVisor-stack, чтобы не привязывать системные сокеты Android к виртуальному IPv6-адресу.
+- Режим выбранных приложений использует `include_package` sing-box и `Builder.addAllowedApplication()`. Сам VibeTun исключается из списка VPN-приложений, чтобы служба могла устанавливать прокси-соединения.
+- Quick Settings-плитка VibeTun: короткое нажатие переключает VPN; если ещё нет профиля или разрешения Android, открывает приложение для настройки. Удержание плитки открывает VibeTun.
 - При первом запуске пользователь получает рекомендацию снять ограничения батареи. Приложение не меняет системные настройки без разрешения пользователя.
 - Профили и учётные данные хранятся локально в приватном хранилище приложения.
 
@@ -27,7 +27,7 @@ Android-клиент GoreBox с интерфейсом в палитре и ви
 - WireGuard (ссылки и стандартные конфиги `.conf`);
 - AmneziaWG 1.x/2.x/3.x `.conf` с параметрами обфускации Jc/Jmin/Jmax, S1–S4, H1–H4, I1–I5 и дополнительными настройками AmneziaWG 3.x;
 - SSH (аутентификация по паролю);
-- полный sing-box JSON (если содержит валидный `outbounds`; при необходимости GoreBox добавляет TUN inbound).
+- полный sing-box JSON (если содержит валидный `outbounds`; при необходимости VibeTun добавляет TUN inbound).
 
 Импортёр может сохранить и другие форматы Windows-версии, но приложение **не запускает заведомо неподдерживаемые профили**: AnyTLS отсутствует в vendored sing-box `1.9.7-neko-1`, ShadowsocksR не реализован в ядре, а MTProto рассчитан на Telegram и не является общим TUN-протоколом. Для них при подключении показывается причина отказа.
 
@@ -37,13 +37,13 @@ Android-клиент GoreBox с интерфейсом в палитре и ви
 
 | Процесс | Служба | Протоколы | Лог-файл |
 |---|---|---|---|
-| основной (UI) | — (`MainActivity`, плитка, `BootReceiver`) | — | `logs/gorebox-main.log` |
-| `:vpn` | `GoreBoxVpnService` (sing-box / libbox) | всё, кроме AmneziaWG | `logs/gorebox-vpn.log`, `logs/core.log` |
-| `:vpn_awg` | `GoreBoxAwgVpnService` (AmneziaWG) | AmneziaWG | `logs/gorebox-awg.log` |
+| основной (UI) | — (`MainActivity`, плитка, `BootReceiver`) | — | `logs/vibetun-main.log` |
+| `:vpn` | `VibeTunVpnService` (sing-box / libbox) | всё, кроме AmneziaWG | `logs/vibetun-vpn.log`, `logs/core.log` |
+| `:vpn_awg` | `VibeTunAwgVpnService` (AmneziaWG) | AmneziaWG | `logs/vibetun-awg.log` |
 
 - `VpnServiceLauncher` — единственная точка запуска и остановки: выбирает службу по протоколу профиля и останавливает службу другого семейства. Процессы больше не убиваются «на лету».
 - Службы поднимают foreground-уведомление сразу в `onStartCommand`, до проверок. Тип `systemExempted` разрешён VPN-приложениям (документация Android 14: VPN apps configured in Settings), нужное разрешение `FOREGROUND_SERVICE_SYSTEM_EXEMPTED` объявлено в манифесте.
-- Watchdog: если состояние зависло в `STARTING` дольше 60 с, служба (в `startTimeout`), UI (`MainActivity`) и плитка переводят его в `ERROR` и гасят службу. Переходы состояний пишутся в `gorebox-*.log`.
+- Watchdog: если состояние зависло в `STARTING` дольше 60 с, служба (в `startTimeout`), UI (`MainActivity`) и плитка переводят его в `ERROR` и гасят службу. Переходы состояний пишутся в `vibetun-*.log`.
 - Always-on VPN работает только с профилями sing-box: система запускает службу без явного профиля, и для AmneziaWG служба сообщает об этом. Для AmneziaWG always-on нужно отключить.
 - «Поделиться логами» отправляет логи всех процессов и `core.log` (с хвостом последних 50 строк при ошибке запуска).
 
@@ -52,7 +52,7 @@ Android-клиент GoreBox с интерфейсом в палитре и ви
 - Все DNS-запросы из TUN перехватываются: правила `protocol: dns` и `port: 53` ведут на outbound типа `dns` (в sing-box 1.9 перехват через `hijack-dns` недоступен, поэтому используется схема `sniff` + dns-outbound). Эти правила стоят первыми, раньше блокировки QUIC.
 - Доменные адреса серверов профилей резолвятся через прямой DNS (bootstrap), чтобы не зависеть от ещё не поднятого прокси.
 - TUIC (sing-quic): попытка QUIC-handshake одна на всех — параллельные соединения ждут её результат, а не строят очередь последовательных попыток за мьютексом; неудача выдаётся всем сразу (раньше на сетях с потерями UDP это замораживало весь туннель на десятки секунд, и приложениям казалось, что «YouTube не работает, остальное еле ползает»). `HandshakeIdleTimeout` поднят с 5 до 10 с для путей с потерями Initial-пакетов; ALPN профиля приводится к `h3` (TUIC v5 не допускает прочих значений).
-- AmneziaWG: GoreBox исключён из собственного VPN (`addDisallowedApplication`) — транспортный UDP-сокет создаётся при первой отправке и до `protect()` первый handshake не должен уходить в собственный TUN. В журнале старта печатаются параметры обфускации (без ключей): при «tx растёт, rx=0» сразу видно расхождение с сервером по Jc/Jmin/Jmax, S1–S4, H1–H4.
+- AmneziaWG: VibeTun исключён из собственного VPN (`addDisallowedApplication`) — транспортный UDP-сокет создаётся при первой отправке и до `protect()` первый handshake не должен уходить в собственный TUN. В журнале старта печатаются параметры обфускации (без ключей): при «tx растёт, rx=0» сразу видно расхождение с сервером по Jc/Jmin/Jmax, S1–S4, H1–H4.
 - Перед стартом конфиг проверяется `Libbox.checkConfig`; в лог пишется конфиг с замаскированными секретами (пароли, UUID, приватные ключи, reality public_key).
 - AmneziaWG: IPv6 без маршрута не выпускается мимо туннеля. `allowFamily(AF_INET6)` пропускает трафик в обычную сеть, поэтому весь IPv6 направляется в TUN и отбрасывается WireGuard-пиром. IPv4 вне `AllowedIPs` идёт напрямую по дизайну split-маршрутов.
 - Замер задержки профиля (ProxyProbeTester) привязывает процесс к сети без VPN на время замера, иначе его сокеты уходят в собственный TUN.
@@ -69,7 +69,7 @@ Android-клиент GoreBox с интерфейсом в палитре и ви
 
 Debug APK появится в `app/build/outputs/apk/debug/app-debug.apk`. Скрипт устанавливает `gomobile`/`gobind` из Go-модуля; Android SDK и NDK должны быть установлены и лицензии приняты. Полученный `app/libs/libbox.aar` игнорируется Git — в репозитории находятся исходники и воспроизводимая сборка, а не локальный бинарный артефакт.
 
-GitHub Actions workflow `.github/workflows/android.yml` собирает ядро, запускает unit-тесты и публикует APK как artifact `GoreBox-debug-apk`. Для этой рабочей ветки workflow также помещает сжатый установочный файл `deliverables/GoreBox-debug-apk.zip` (debug-подпись) в ветку; распакуйте архив, чтобы получить `GoreBox-debug.apk`.
+GitHub Actions workflow `.github/workflows/android.yml` собирает ядро, запускает unit-тесты и публикует APK как artifact `VibeTun-debug-apk`. Для этой рабочей ветки workflow также помещает сжатый установочный файл `deliverables/VibeTun-debug-apk.zip` (debug-подпись) в ветку; распакуйте архив, чтобы получить `VibeTun-debug.apk`.
 
 ### Статус проверок протоколов
 
@@ -88,7 +88,7 @@ GitHub Actions workflow `.github/workflows/android.yml` собирает ядр�
 | WireGuard (ссылка и `.conf`) | да (базовый) | не проверено |
 | SSH | да | не проверено |
 | Полный sing-box JSON | да (DNS-outbound, sniff, bootstrap) | не проверено |
-| AmneziaWG 1.x/2.x/3.x | да (парсер, keepalive, версии параметров) | проверено: handshake не доходил до сервера (tx растёт, rx=0); добавлено исключение GoreBox из собственного VPN, журналирование параметров обфускации и диагностика в ошибке |
+| AmneziaWG 1.x/2.x/3.x | да (парсер, keepalive, версии параметров) | проверено: handshake не доходил до сервера (tx растёт, rx=0); добавлено исключение VibeTun из собственного VPN, журналирование параметров обфускации и диагностика в ошибке |
 
 «Не проверено» означает: конфиг собирается и проходит проверку структуры, но до подключения к реальному серверу дело не доходило. Ниже чек-лист для ручной проверки.
 
@@ -96,12 +96,12 @@ GitHub Actions workflow `.github/workflows/android.yml` собирает ядр�
 
 Для каждого протокола (VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, WireGuard, AmneziaWG):
 
-1. Подключение меньше чем за 15 с, состояние `RUNNING`, в `gorebox-*.log` нет ошибок.
+1. Подключение меньше чем за 15 с, состояние `RUNNING`, в `vibetun-*.log` нет ошибок.
 2. Открывается сайт по домену **и** по IP (проверка DNS-перехвата).
 3. Проверка утечки DNS и IPv6 (любой публичный тест).
 4. Переключение без перезапуска приложения. Обязательная цепочка: AmneziaWG → Hysteria2 → AmneziaWG → VLESS (регрессия исходной ошибки).
 5. Выключение и включение через плитку. Убийство приложения из списка недавних при активном VPN. Перезагрузка с автозапуском.
-6. «Поделиться логами»: присланы `gorebox-*.log` и `core.log`.
+6. «Поделиться логами»: присланы `vibetun-*.log` и `core.log`.
 7. Сценарий «нет handshake»: AmneziaWG с неверным ключом должен дать ошибку за ≤ 30 с, а не бесконечное «подключение».
 
 ## Важные ограничения Android

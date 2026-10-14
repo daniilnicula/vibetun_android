@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace = "com.goresense.gorebox"
+    namespace = "com.vibetun.app"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.goresense.gorebox"
+        applicationId = "com.vibetun.app"
         minSdk = 26
         targetSdk = 35
         versionCode = 1
