@@ -138,28 +138,4 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Keep a downloadable APK archive on the main branch
-        if: github.ref == 'refs/heads/main'
-        run: |
-          mkdir -p deliverables
-          python3 - <<'PY'
-          from pathlib import Path
-          from zipfile import ZIP_DEFLATED, ZipFile
-          apk = Path('app/build/outputs/apk/debug/app-debug.apk')
-          archive = Path('deliverables/VibeTun-debug-apk.zip')
-          with ZipFile(archive, 'w', compression=ZIP_DEFLATED, compresslevel=9) as output:
-              output.write(apk, arcname='VibeTun-debug.apk')
-          size = archive.stat().st_size
-          print(f'Compressed APK archive: {size} bytes')
-          if size >= 100_000_000:
-              raise SystemExit('Compressed APK archive exceeds GitHub\'s 100 MB file limit.')
-          PY
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add deliverables/VibeTun-debug-apk.zip
-          if git diff --cached --quiet; then
-            echo "The branch already contains the current APK archive."
-          else
-            git commit -m "Add compressed downloadable VibeTun debug APK"
-            git push origin HEAD:refs/heads/main
-          fi
+      # APK выкладывается только в релизы (upload-artifact выше сохраняет его в артефактах прогона).
