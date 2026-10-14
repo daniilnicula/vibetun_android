@@ -1,6 +1,8 @@
 package com.goresense.gorebox.data
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import com.goresense.gorebox.service.GoreBoxVpnService
 import io.nekohasekai.libbox.BoxService
 import io.nekohasekai.libbox.InterfaceUpdateListener
@@ -44,6 +46,9 @@ object ProxyProbeTester {
             return LatencyTester.ping(profile, attempts, timeoutMs)
         }
         var best: Long? = null
+        // Сокеты probe-сервиса создаются в ЭТОМ процессе, а не в :vpn, где есть protect().
+        // Если VPN активен, без привязки они уйдут в собственный TUN и замер не получится.
+        val boundNetwork = bindProcessToPhysicalNetwork(appContext)
         try {
             service.start()
             repeat(attempts) { attempt ->
@@ -71,9 +76,28 @@ object ProxyProbeTester {
             // сервис не стартовал — best останется null
         } finally {
             runCatching { service.close() }
+            if (boundNetwork) {
+                runCatching { appContext.getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(null) }
+            }
         }
         return best
     }
+
+    /** Привязываем процесс к сети без VPN-транспорта (Wi-Fi/сотовая/Ethernet); true — если получилось. */
+    private fun bindProcessToPhysicalNetwork(context: Context): Boolean = runCatching {
+        val connectivity = context.getSystemService(ConnectivityManager::class.java) ?: return@runCatching false
+        val physical = connectivity.allNetworks.firstOrNull { network ->
+            val caps = connectivity.getNetworkCapabilities(network) ?: return@firstOrNull false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                (
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+                    )
+        } ?: return@runCatching false
+        connectivity.bindProcessToNetwork(physical)
+    }.getOrDefault(false)
 
     private fun ensureLibbox(context: Context): Boolean {
         if (libboxReady) return true

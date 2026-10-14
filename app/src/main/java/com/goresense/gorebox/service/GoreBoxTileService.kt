@@ -22,7 +22,7 @@ class GoreBoxTileService : TileService() {
         super.onClick()
         val state = stateStore.state
         if (state == ConnectionState.RUNNING) {
-            startVpnService(GoreBoxVpnService.ACTION_STOP)
+            VpnServiceLauncher.stop(this)
             stateStore.update(ConnectionState.STOPPED)
             updateTileState()
             return
@@ -35,19 +35,9 @@ class GoreBoxTileService : TileService() {
         if (!NativeCoreStatus.isIntegrated || !selectedProfileExists || VpnService.prepare(this) != null) {
             openApp(requestConnect = true)
         } else {
-            startVpnService(GoreBoxVpnService.ACTION_TOGGLE)
+            store.loadProfiles().firstOrNull { it.id == store.selectedProfileId }
+                ?.let { VpnServiceLauncher.start(this, it) }
             updateTileState()
-        }
-    }
-
-    private fun startVpnService(action: String) {
-        val intent = Intent(this, GoreBoxVpnService::class.java).setAction(action)
-        if (action == GoreBoxVpnService.ACTION_STOP) {
-            startService(intent)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
         }
     }
 
@@ -71,6 +61,12 @@ class GoreBoxTileService : TileService() {
 
     private fun updateTileState() {
         val tile = qsTile ?: return
+        // Watchdog тайла: зависшее STARTING (служба умерла или не ответила) переводим в ошибку,
+        // иначе плитка навсегда останется «недоступна».
+        if (stateStore.state == ConnectionState.STARTING && stateStore.ageMs > ConnectionStateStore.START_TIMEOUT_MS) {
+            stateStore.update(ConnectionState.ERROR, "VPN-служба не ответила. Пришлите логи (Настройки → Логи).")
+            VpnServiceLauncher.stop(this)
+        }
         val state = stateStore.state
         tile.state = when (state) {
             ConnectionState.RUNNING -> Tile.STATE_ACTIVE

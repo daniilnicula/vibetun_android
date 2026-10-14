@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.service.quicksettings.TileService
+import com.goresense.gorebox.data.AppLog
 import com.goresense.gorebox.data.ConnectionState
 import java.io.File
 
@@ -27,7 +28,13 @@ class ConnectionStateStore(context: Context) {
     val message: String
         get() = readFromFile()?.second ?: prefs.getString(KEY_MESSAGE, "").orEmpty()
 
+    /** Сколько миллисекунд состояние не менялось (для watchdog зависшего STARTING). */
+    val ageMs: Long
+        get() = if (stateFile.isFile) System.currentTimeMillis() - stateFile.lastModified() else Long.MAX_VALUE
+
     fun update(state: ConnectionState, message: String = "") {
+        val previous = runCatching { readFromFile()?.first }.getOrNull()
+        AppLog.i("State", "${previous ?: "—"} -> $state${if (message.isNotBlank()) " ($message)" else ""}")
         runCatching {
             val tmp = File(stateFile.parentFile, stateFile.name + ".tmp")
             tmp.writeText(state.name + "\n" + message)
@@ -64,6 +71,8 @@ class ConnectionStateStore(context: Context) {
         const val ACTION_STATE_CHANGED = "com.goresense.gorebox.CONNECTION_STATE_CHANGED"
         const val EXTRA_STATE = "state"
         const val EXTRA_MESSAGE = "message"
+        /** Сколько ждём перехода из STARTING, прежде чем признать подключение зависшим. */
+        const val START_TIMEOUT_MS = 60_000L
         private const val KEY_STATE = "state"
         private const val KEY_MESSAGE = "message"
     }

@@ -24,6 +24,12 @@ class AmneziaWgConfigParserTest {
         assertTrue(userspace.contains("endpoint=198.51.100.8:51820\n"))
         assertTrue(userspace.contains("persistent_keepalive_interval=25\n"))
         assertTrue(userspace.contains("preshared_key=${"01".repeat(32)}\n"))
+
+        // В журнале запуска параметры обфускации есть, а ключей — нет.
+        val debug = config.debugDescription()
+        assertTrue(debug.contains("jc=4"))
+        assertTrue(debug.contains("h1=123456"))
+        assertTrue(!debug.contains("private_key"))
     }
 
     @Test
@@ -56,6 +62,48 @@ class AmneziaWgConfigParserTest {
             AmneziaWgConfig.parse(sampleConfig.replace("AllowedIPs = 0.0.0.0/0, ::/0", "AllowedIPs = "))
         }.exceptionOrNull()
         assertTrue(missingRoutes is IllegalArgumentException)
+    }
+
+    private fun configWithKeepalive(line: String?): String =
+        sampleConfig.lines().filterNot { it.trim().startsWith("PersistentKeepalive") }
+            .let { lines -> if (line == null) lines else lines + "        $line" }
+            .joinToString("\n")
+
+    @Test
+    fun `keeps 25 second keepalive when PersistentKeepalive is absent`() {
+        val userspace = AmneziaWgConfig.parse(configWithKeepalive(null)).userspaceConfig { "198.51.100.8:51820" }
+        assertTrue(userspace.contains("persistent_keepalive_interval=25\n"))
+    }
+
+    @Test
+    fun `PersistentKeepalive zero or off disables keepalive`() {
+        listOf("PersistentKeepalive = 0", "PersistentKeepalive = off").forEach { line ->
+            val userspace = AmneziaWgConfig.parse(configWithKeepalive(line)).userspaceConfig { "198.51.100.8:51820" }
+            assertTrue("$line must not emit keepalive", !userspace.contains("persistent_keepalive_interval"))
+        }
+    }
+
+    @Test
+    fun `parses AWG 1x configuration without S3 S4 and I1-I5`() {
+        val legacy = sampleConfig.lines()
+            .filterNot { line -> listOf("S2", "I1", "HeaderProtectionKey", "ContentPaddingAddition", "RandomTrailers").any { line.trim().startsWith(it) } }
+            .joinToString("\n")
+        val config = AmneziaWgConfig.parse(legacy)
+        val userspace = config.userspaceConfig { "198.51.100.8:51820" }
+        assertEquals(listOf("10.8.0.2/32", "fd00::2/128"), config.addresses)
+        assertTrue(userspace.contains("jc=4\n"))
+        assertTrue(!userspace.contains("header_protection_key"))
+    }
+
+    @Test
+    fun `tolerates extra spaces and mixed-case keys`() {
+        val messy = sampleConfig
+            .replace("[Peer]", "  [peer]  ")
+            .replace("AllowedIPs = 0.0.0.0/0, ::/0", "allowedips   =   0.0.0.0/0 ,   ::/0  ")
+            .replace("Address = 10.8.0.2/32, fd00::2/128", "ADDRESS=10.8.0.2/32,fd00::2/128")
+        val config = AmneziaWgConfig.parse(messy)
+        assertEquals(listOf("10.8.0.2/32", "fd00::2/128"), config.addresses)
+        assertEquals(listOf("0.0.0.0/0", "::/0"), config.peerAllowedIps())
     }
 
     private val sampleConfig = """

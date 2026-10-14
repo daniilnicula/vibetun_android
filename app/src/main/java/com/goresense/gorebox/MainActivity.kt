@@ -20,7 +20,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.goresense.gorebox.data.GoreBoxViewModel
 import com.goresense.gorebox.service.ConnectionStateStore
-import com.goresense.gorebox.service.GoreBoxVpnService
+import com.goresense.gorebox.service.VpnServiceLauncher
 import com.goresense.gorebox.service.NativeCoreStatus
 import com.goresense.gorebox.ui.GoreBoxRoot
 import com.goresense.gorebox.ui.GoreBoxTheme
@@ -159,6 +159,11 @@ class MainActivity : ComponentActivity() {
         viewModel.refreshConnectionState()
     }
 
+    override fun onDestroy() {
+        startWatchdog.removeCallbacksAndMessages(null)
+        super.onDestroy()
+    }
+
     override fun onStop() {
         if (stateReceiverRegistered) {
             unregisterReceiver(stateReceiver)
@@ -175,7 +180,8 @@ class MainActivity : ComponentActivity() {
 
     private fun toggleProxy() {
         if (viewModel.connectionState == com.goresense.gorebox.data.ConnectionState.RUNNING) {
-            requestService(GoreBoxVpnService.ACTION_STOP)
+            startWatchdog.removeCallbacksAndMessages(null)
+            VpnServiceLauncher.stop(this)
             viewModel.setConnectionState(com.goresense.gorebox.data.ConnectionState.STOPPED)
             return
         }
@@ -197,24 +203,31 @@ class MainActivity : ComponentActivity() {
             viewModel.showCoreUnavailable()
             return
         }
+        val profile = viewModel.selectedProfile ?: return
         viewModel.setConnectionState(com.goresense.gorebox.data.ConnectionState.STARTING, "Запуск…")
-        requestService(GoreBoxVpnService.ACTION_START)
+        // Службу выбирает лаунчер по протоколу: AmneziaWG и sing-box живут в разных процессах.
+        VpnServiceLauncher.start(this, profile)
+        armStartWatchdog()
     }
 
-    private fun requestService(action: String) {
-        val serviceIntent = Intent(this, GoreBoxVpnService::class.java).setAction(action)
-        if (action == GoreBoxVpnService.ACTION_START) {
-            // Профиль передаём явно: даже с MODE_MULTI_PROCESS prefs надёжнее не гонять
-            // через межпроцессный кэш.
-            serviceIntent.putExtra(GoreBoxVpnService.EXTRA_PROFILE_ID, viewModel.selectedProfileId)
-        }
-        if (action == GoreBoxVpnService.ACTION_STOP) {
-            startService(serviceIntent)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
-        }
+    private val startWatchdog = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /**
+     * Страховка от вечного «Подключение…»: состояние пишет служба в другом процессе,
+     * и если она умерла или не стартовала, никто не переведёт UI в ошибку.
+     */
+    private fun armStartWatchdog() {
+        startWatchdog.removeCallbacksAndMessages(null)
+        startWatchdog.postDelayed({
+            viewModel.refreshConnectionState() // свежее состояние из файла
+            if (viewModel.connectionState == com.goresense.gorebox.data.ConnectionState.STARTING) {
+                VpnServiceLauncher.stop(this)
+                viewModel.setConnectionState(
+                    com.goresense.gorebox.data.ConnectionState.ERROR,
+                    "VPN-служба не ответила за ${START_TIMEOUT_MS / 1000} с. Пришлите логи (Настройки → Логи).",
+                )
+            }
+        }, START_TIMEOUT_MS)
     }
 
     private fun pasteFromClipboard() {
@@ -274,5 +287,6 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_CONNECT_FROM_TILE = "connect_from_qs_tile"
+        private const val START_TIMEOUT_MS = 60_000L
     }
 }

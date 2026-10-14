@@ -39,6 +39,21 @@ internal class AmneziaWgConfig private constructor(
         return lines.joinToString(separator = "\n", postfix = "\n")
     }
 
+    /**
+     * Параметры обфускации и маршрутизации для журнала запуска (без ключей и PSK).
+     * Нужны для диагностики «tx растёт, rx=0»: если клиент и сервер расходятся
+     * в Jc/Jmin/Jmax, S1–S4, H1–H4, сервер молча отбрасывает handshake.
+     */
+    fun debugDescription(): String {
+        val parts = mutableListOf<String>()
+        interfaceOptions.forEach { (key, value) ->
+            if (key != "private_key") parts += "$key=$value"
+        }
+        parts += "peers=${peers.size}"
+        parts += "mtu=$mtu"
+        return parts.joinToString(separator = ", ")
+    }
+
     fun peerAllowedIps(): List<String> = peers.flatMap { it.allowedIps }.distinct()
 
     companion object {
@@ -115,7 +130,10 @@ internal class AmneziaWgConfig private constructor(
                         ?.let { keyToHex(it, "PresharedKey") },
                     endpoint = endpoint,
                     allowedIps = allowedIps,
-                    persistentKeepalive = keepalive?.takeIf { it.isNotBlank() && !it.equals("off", true) && it != "0" }
+                    // Без PersistentKeepalive WireGuard не шлёт handshake, пока нет исходящего трафика —
+                    // клиент ждал handshake впустую и падал по таймауту. Для мобильного клиента по умолчанию 25 с.
+                    persistentKeepalive = (keepalive?.takeIf { it.isNotBlank() } ?: DEFAULT_KEEPALIVE)
+                        .takeIf { !it.equals("off", true) && it != "0" }
                         ?.also {
                             val seconds = it.toIntOrNull()
                             require(seconds != null && seconds in 1..65535) {
@@ -198,6 +216,7 @@ internal class AmneziaWgConfig private constructor(
             value.contains(':') || IPV4_PATTERN.matches(value)
 
         private const val DEFAULT_MTU = 1280
+        private const val DEFAULT_KEEPALIVE = "25"
         private const val MIN_MTU = 576
         private const val MAX_MTU = 9000
     }

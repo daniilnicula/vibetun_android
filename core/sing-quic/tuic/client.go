@@ -48,6 +48,19 @@ type Client struct {
 
 	connAccess sync.RWMutex
 	conn       *clientQUICConnection
+
+	// dial хранит состояние текущей попытки QUIC-handshake. Пока попытка идёт,
+	// все новые соединения ждут её результат: раньше каждый ожидающий стоял
+	// за мьютексом и после неудачи запускал СВОЙ handshake последовательно —
+	// на мобильных сетях с потерями это замораживало весь трафик туннеля
+	// (каждое соединение ждало 5-10с собственной попытки).
+	dial *dialAttempt
+}
+
+type dialAttempt struct {
+	done chan struct{}
+	conn *clientQUICConnection
+	err  error
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -58,6 +71,11 @@ func NewClient(options ClientOptions) (*Client, error) {
 		DisablePathMTUDiscovery: !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
 		EnableDatagrams:         true,
 		MaxIncomingUniStreams:   1 << 60,
+		// 5с по умолчанию мало для сетей, где Initial-пакеты ходят с потерями
+		// (DPI/троттлинг UDP): рукопожатие, завершившееся за 3с, на грани таймаута.
+		// 10с дают таким путям шанс установиться; безнадёжные пути всё равно
+		// отказывают быстро и результат получают все ожидающие сразу.
+		HandshakeIdleTimeout: 10 * time.Second,
 	}
 	switch options.CongestionControl {
 	case "":
@@ -87,16 +105,41 @@ func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
 		return conn, nil
 	}
 	c.connAccess.Lock()
-	defer c.connAccess.Unlock()
 	conn = c.conn
 	if conn != nil && conn.active() {
+		c.connAccess.Unlock()
 		return conn, nil
 	}
-	conn, err := c.offerNew(ctx)
-	if err != nil {
-		return nil, err
+	if attempt := c.dial; attempt != nil {
+		// Handshake уже выполняется другой горутиной: ждём общий результат,
+		// а не строим за мьютексом очередь повторных попыток. Неудача выдаётся
+		// всем ожидающим сразу — приложения быстро повторят запрос, вместо
+		// заморозки на callers × handshake_timeout.
+		c.connAccess.Unlock()
+		select {
+		case <-attempt.done:
+			return attempt.conn, attempt.err
+		case <-ctx.Done():
+			// Общая попытка продолжает работать (живёт в c.ctx):
+			// установившееся соединение подхватят следующие запросы.
+			return nil, ctx.Err()
+		}
 	}
-	return conn, nil
+	attempt := &dialAttempt{done: make(chan struct{})}
+	c.dial = attempt
+	c.connAccess.Unlock()
+
+	conn, err := c.offerNew(ctx)
+
+	c.connAccess.Lock()
+	c.dial = nil
+	if err == nil {
+		c.conn = conn
+	}
+	c.connAccess.Unlock()
+	attempt.conn, attempt.err = conn, err
+	close(attempt.done)
+	return conn, err
 }
 
 func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
@@ -132,7 +175,6 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 	}
 	go c.loopMessages(conn)
 	go c.loopHeartbeats(conn)
-	c.conn = conn
 	return conn, nil
 }
 

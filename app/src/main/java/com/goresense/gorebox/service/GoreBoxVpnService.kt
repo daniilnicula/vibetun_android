@@ -16,7 +16,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
-import android.os.Process
 import android.os.SystemClock
 import android.system.OsConstants
 import android.util.Log
@@ -41,6 +40,7 @@ import io.nekohasekai.libbox.StringIterator
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
 import org.amnezia.awg.GoBackend as AmneziaGoBackend
+import java.io.File
 import java.net.Inet4Address
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -52,8 +52,18 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
-/** Android VpnService hosting the bundled sing-box/libbox data plane. */
-class GoreBoxVpnService : VpnService(), PlatformInterface {
+/**
+ * Android VpnService hosting the bundled sing-box/libbox data plane.
+ *
+ * Два Go-runtime (libbox.so и libwg-go.so) не уживаются в одном процессе, поэтому у каждого
+ * семейства ядра своя служба в своём процессе: эта (libbox, процесс `:vpn`) и
+ * [GoreBoxAwgVpnService] (AmneziaWG, процесс `:vpn_awg`). Нужную службу выбирает
+ * [VpnServiceLauncher] по протоколу профиля — убивать процесс «на лету» больше не нужно.
+ */
+open class GoreBoxVpnService : VpnService(), PlatformInterface {
+    /** Семейство ядра, которое обслуживает эта служба. */
+    protected open val engineFamily: String get() = FAMILY_LIBBOX
+
     private val stateStore by lazy { ConnectionStateStore(this) }
     private val profileStore by lazy { GoreBoxStore(this) }
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
@@ -74,24 +84,64 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        AppLog.i(TAG, "onStartCommand action=${intent?.action ?: ACTION_START}")
-        when (intent?.action ?: ACTION_START) {
+        val action = intent?.action ?: ACTION_START
+        AppLog.i(TAG, "onStartCommand action=$action")
+        // startForegroundService обязывает вызвать startForeground в течение 5 с. Поэтому поднимаем
+        // уведомление сразу, ДО любых проверок (VPN-разрешение, ядро, профиль): иначе ранний fail()
+        // даёт ForegroundServiceDidNotStartInTimeException.
+        if (action == ACTION_START || action == ACTION_TOGGLE) {
+            promoteToForeground(intent?.getStringExtra(EXTRA_PROFILE_ID))
+        }
+        when (action) {
             ACTION_STOP -> stopConnection()
-            ACTION_TOGGLE -> if (isProxyActive()) stopConnection() else scheduleStart()
+            ACTION_TOGGLE -> if (isProxyActive()) stopConnection() else {
+                scheduleStart()
+                armStartWatchdog()
+            }
             ACTION_START -> {
                 // Явный старт при активном подключении = пользователь сменил профиль.
                 // Раньше старт молча проглатывался (isProxyActive -> return), UI вис в
                 // «Подключаемся…», а старый туннель продолжал работать.
                 if (isProxyActive()) {
                     AppLog.i(TAG, "ACTION_START при активном подключении — перезапуск с выбранным профилем")
-                    stopConnection()
+                    // Останавливаем только ядро, но НЕ саму службу: stopSelf() здесь приводил к onDestroy,
+                    // который сбрасывал отложенный старт (removeCallbacksAndMessages) — UI вис в «Подключаемся…».
+                    mainHandler.removeCallbacksAndMessages(null)
+                    closeNativeService()
+                    lastStoppedAtMs = SystemClock.elapsedRealtime()
                 }
                 requestedProfileId = intent?.getStringExtra(EXTRA_PROFILE_ID)?.takeIf { it.isNotBlank() }
                 scheduleStart()
+                armStartWatchdog()
             }
             else -> stopSelf(startId)
         }
         return START_STICKY
+    }
+
+    private fun promoteToForeground(profileId: String?) {
+        createNotificationChannel()
+        val notification = buildNotification(profileId)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    /**
+     * Страховка службы: если подключение зависло в STARTING (ядро не ответило, UI закрыт и тайл
+     * не может обновиться), переводим состояние в ERROR и гасим службу.
+     */
+    private val startTimeout = Runnable {
+        if (stateStore.state == ConnectionState.STARTING) {
+            fail("VPN-служба не ответила за ${ConnectionStateStore.START_TIMEOUT_MS / 1000} с. Пришлите логи (Настройки → Логи).")
+        }
+    }
+
+    private fun armStartWatchdog() {
+        mainHandler.removeCallbacks(startTimeout)
+        mainHandler.postDelayed(startTimeout, ConnectionStateStore.START_TIMEOUT_MS)
     }
 
     /**
@@ -122,35 +172,19 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         }
 
         stateStore.update(ConnectionState.STARTING, "Подготовка VPN-интерфейса…")
-        createNotificationChannel()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                buildNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED,
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, buildNotification())
-        }
 
+        val explicitRequest = requestedProfileId != null
         try {
             val profile = loadSelectedProfile()
+            logStartHeader(profile)
             AppLog.i(TAG, "startConnection: профиль ${profile.id} (${profile.protocol}) ${profile.name}")
-            // Два разных Go-runtime (libbox.so и libwg-go.so) не уживаются в одном процессе:
-            // старт ядра другого семейства после предыдущего падает нативно (SIGSEGV/SIGABRT).
-            // Поэтому при смене семейства аккуратно перезапускаем процесс :vpn — sticky-рестарт
-            // сам доведёт подключение до конца уже в чистом процессе, UI при этом не трогаем.
-            val family = if (profile.protocol.equals("amneziawg", ignoreCase = true)) FAMILY_AWG else FAMILY_LIBBOX
-            val lastFamily = lastEngineFamily
-            if (lastFamily != null && lastFamily != family) {
-                AppLog.i(TAG, "startConnection: смена семейства ядра $lastFamily -> $family, контролируемый перезапуск :vpn")
-                stateStore.update(ConnectionState.STARTING, "Перезапуск VPN-процесса…")
-                closeNativeService()
-                lastStoppedAtMs = SystemClock.elapsedRealtime()
-                mainHandler.postDelayed({
-                    stopSelf()
-                    Process.killProcess(Process.myPid())
-                }, 300)
+            // Служба обязана соответствовать семейству ядра профиля (см. VpnServiceLauncher).
+            val family = familyOf(profile.protocol)
+            if (family != engineFamily) {
+                AppLog.e(TAG, "startConnection: профиль ${profile.protocol} запущен не той службой ($engineFamily)")
+                val hint = if (explicitRequest) "" else
+                    " Always-on VPN поддерживает только профили sing-box: для AmneziaWG отключите always-on."
+                fail("Профиль ${profile.name} запущен не той VPN-службой. Переподключитесь.$hint")
                 return
             }
             if (profile.protocol.equals("amneziawg", ignoreCase = true)) {
@@ -160,7 +194,6 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
                 startSingBox(profile)
                 stateStore.update(ConnectionState.RUNNING, "Прокси включён · ${profile.name}")
             }
-            lastEngineFamily = family
             profileStore.proxyWasActive = true
             Log.i(TAG, "Proxy core started for profile ${profile.id} (${profile.protocol})")
             AppLog.i(TAG, "startConnection: ядро запущено успешно (${profile.protocol})")
@@ -168,9 +201,30 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
             if (error is VirtualMachineError || error is ThreadDeath) throw error
             Log.e(TAG, "Failed to start proxy core", error)
             AppLog.e(TAG, "Failed to start proxy core", error)
+            coreLogTail().takeIf { it.isNotEmpty() }?.let { AppLog.e(TAG, "Хвост core.log (50 строк):\n$it") }
             fail(error.message?.takeIf { it.isNotBlank() } ?: "Не удалось запустить прокси-ядро.")
         }
     }
+
+    /** Заголовок лога при старте: версия приложения, Android, ABI, протокол и версии ядер. */
+    private fun logStartHeader(profile: ProxyProfile) {
+        val appVersion = runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull()
+        val awg = if (familyOf(profile.protocol) == FAMILY_AWG) {
+            runCatching { AmneziaGoBackend.awgVersion() }.getOrDefault("недоступно")
+        } else {
+            "не используется"
+        }
+        AppLog.i(
+            TAG,
+            "=== старт: GoreBox $appVersion, Android API ${Build.VERSION.SDK_INT}, ABI ${Build.SUPPORTED_ABIS.joinToString()}, " +
+                "протокол ${profile.protocol}, процесс ${engineFamily}, sing-box ${NativeCoreStatus.SING_BOX_VERSION}, AmneziaWG $awg",
+        )
+    }
+
+    /** Последние 50 строк core.log (лог sing-box), чтобы причина падения попала в gorebox-*.log. */
+    private fun coreLogTail(): String = runCatching {
+        File(filesDir, "logs/core.log").takeIf { it.isFile }?.readLines()?.takeLast(50)?.joinToString("\n").orEmpty()
+    }.getOrDefault("")
 
     private fun startSingBox(profile: ProxyProfile) {
         AppLog.i(TAG, "startSingBox: сборка конфигурации…")
@@ -183,6 +237,13 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         )
         val basePath = filesDir.absolutePath
         ensureLibboxReady(basePath)
+        AppLog.i(TAG, "startSingBox: конфиг (секреты скрыты) ${SingBoxConfigBuilder.redactForLog(config)}")
+        // Предстартовая проверка: понятная причина ошибки вместо нативного падения при newService.
+        try {
+            Libbox.checkConfig(config)
+        } catch (error: Exception) {
+            throw IllegalStateException("Конфигурация отклонена ядром sing-box: ${error.message}", error)
+        }
         AppLog.i(TAG, "startSingBox: Libbox.newService…")
         val service = Libbox.newService(config, this)
         boxService = service
@@ -210,6 +271,9 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
     private fun startAmneziaWg(profile: ProxyProfile) {
         AppLog.i(TAG, "startAmneziaWg: разбор конфигурации…")
         val config = AmneziaWgConfig.parse(profile.source)
+        // Параметры обфускации в журнал: при «tx растёт, rx=0» сразу видно,
+        // какие Jc/S/H-значения реально дошли до ядра (ключи не логируются).
+        AppLog.i(TAG, "startAmneziaWg: параметры ${config.debugDescription()}")
         val userspaceConfig = config.userspaceConfig(::resolveAwgEndpoint)
         val builder = Builder()
             .setSession("GoreBox · AmneziaWG")
@@ -236,14 +300,24 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
             if (prefix == 0 && address is Inet4Address) hasIpv4DefaultRoute = true
             if (prefix == 0 && address is Inet6Address) hasIpv6DefaultRoute = true
         }
+        // IPv4 без default-маршрута идёт мимо туннеля по дизайну (split-маршруты из AllowedIPs).
         if (!hasIpv4DefaultRoute) builder.allowFamily(OsConstants.AF_INET)
-        if (!hasIpv6DefaultRoute) builder.allowFamily(OsConstants.AF_INET6)
+        // IPv6 НЕ разрешаем через allowFamily: по документации Builder.allowFamily такой трафик
+        // уходит в обычную сеть в обход VPN (утечка). Вместо этого весь IPv6 отправляем в TUN,
+        // где WireGuard-пир (IPv4-only AllowedIPs) его отбрасывает.
+        if (!hasIpv6DefaultRoute) builder.addRoute("::", 0)
         if (profileStore.selectedAppsOnly) {
             val selectedPackages = profileStore.selectedAppPackages.sorted()
             require(selectedPackages.isNotEmpty()) {
                 "Для режима «Выбранные приложения» отметьте хотя бы одно приложение."
             }
             addApplications(builder, StringIteratorImpl(selectedPackages), allowed = true)
+        } else {
+            // GoreBox не должен попадать в собственный VPN: транспортный UDP-сокет
+            // AmneziaWG создаётся при первой отправке и в этот момент ещё не защищён
+            // protect() — без исключения первый handshake уходит в собственный TUN
+            // и до сервера не доходит (rx=0 при растущем tx).
+            builder.addDisallowedApplication(packageName)
         }
         // приложения с маршрутом DIRECT идут мимо туннеля AmneziaWG
         val directPackages = profileStore.directAppPackages.sorted()
@@ -296,10 +370,22 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
                 }
             }
             if (amneziaHandle == handle) {
-                AppLog.e(TAG, "AmneziaWG: handshake не установлен за ${AWG_HANDSHAKE_TIMEOUT_MS / 1000}с")
+                // tx>0 и rx=0 → пакеты уходят, но сервер молчит (ключ/параметры обфускации/порт/блокировка);
+                // tx=0 → ничего не отправлено (петля в TUN, нет маршрута, не разрешился endpoint).
+                val stats = runCatching { AmneziaGoBackend.awgGetStats(handle) }.getOrNull().orEmpty()
+                fun stat(name: String) = stats.lineSequence().firstOrNull { it.startsWith("$name=") }?.substringAfter('=')?.trim()
+                val tx = stat("tx_bytes")?.toLongOrNull() ?: 0L
+                val rx = stat("rx_bytes")?.toLongOrNull() ?: 0L
+                AppLog.e(TAG, "AmneziaWG: handshake не установлен за ${AWG_HANDSHAKE_TIMEOUT_MS / 1000}с " +
+                    "(tx_bytes=${stat("tx_bytes")}, rx_bytes=${stat("rx_bytes")}, endpoint=${stat("endpoint")})")
+                val hint = if (tx > 0 && rx == 0L) {
+                    " Пакеты уходят, но сервер не отвечает: чаще всего это несовпадение параметров " +
+                        "обфускации (Jc/Jmin/Jmax, S1–S4, H1–H4) с сервером, неверный порт/ключ " +
+                        "или блокировка протокола сетью."
+                } else ""
                 mainHandler.post {
                     if (amneziaHandle == handle) {
-                        fail("AmneziaWG не смог связаться с сервером (нет handshake за 20 секунд). Проверьте ключ и сеть.")
+                        fail("AmneziaWG не смог связаться с сервером (нет handshake за ${AWG_HANDSHAKE_TIMEOUT_MS / 1000} секунд). Проверьте ключ и сеть.$hint")
                     }
                 }
             }
@@ -338,6 +424,7 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         }
         val numericHost = checkNotNull(address.hostAddress).substringBefore('%')
         val formattedHost = if (address is Inet6Address) "[$numericHost]" else numericHost
+        AppLog.i(TAG, "AmneziaWG endpoint: $host -> $formattedHost:$port")
         return "$formattedHost:$port"
     }
 
@@ -682,14 +769,17 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         )
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(profileId: String? = requestedProfileId): Notification {
         val openApp = PendingIntent.getActivity(
             this,
             0,
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val selected = runCatching { loadSelectedProfile().name }.getOrDefault("Прокси активен")
+        // Не используем loadSelectedProfile(): он сбрасывает requestedProfileId.
+        val selected = runCatching {
+            profileStore.loadProfiles().firstOrNull { it.id == (profileId ?: profileStore.selectedProfileId) }?.name
+        }.getOrNull() ?: "Прокси активен"
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_tile_gorebox)
             .setContentTitle(getString(R.string.notification_title))
@@ -722,19 +812,18 @@ class GoreBoxVpnService : VpnService(), PlatformInterface {
         private const val NOTIFICATION_ID = 4201
         private const val NO_AMNEZIA_HANDLE = -1
         private const val SETTLE_DELAY_MS = 2500L
-        private const val AWG_HANDSHAKE_TIMEOUT_MS = 20_000L
-        private const val FAMILY_AWG = "awg"
-        private const val FAMILY_LIBBOX = "libbox"
+        private const val AWG_HANDSHAKE_TIMEOUT_MS = 30_000L
+        internal const val FAMILY_AWG = "awg"
+        internal const val FAMILY_LIBBOX = "libbox"
+
+        internal fun familyOf(protocol: String): String =
+            if (protocol.equals("amneziawg", ignoreCase = true)) FAMILY_AWG else FAMILY_LIBBOX
         private val IPV4_PATTERN = Regex("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$")
         private const val TAG = "GoreBoxVpnService"
 
         /** Libbox.setup допустим только один раз за жизнь процесса — повторные вызовы роняли нативный код. */
         @Volatile
         private var libboxReady: Boolean = false
-
-        /** Семейство последнего запущенного ядра (per-process). */
-        @Volatile
-        private var lastEngineFamily: String? = null
 
         /** Активный экземпляр сервиса в этом процессе (для protect() probe-сокетов). */
         @Volatile

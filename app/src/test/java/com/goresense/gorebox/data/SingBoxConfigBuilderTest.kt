@@ -132,4 +132,75 @@ class SingBoxConfigBuilderTest {
         port = 0,
         source = source,
     )
+
+    @Test
+    fun `routes DNS from TUN to dns outbound before any other rule`() {
+        val config = JSONObject(SingBoxConfigBuilder.build(profile("hysteria2", "hy2://pass@hy.example:443")))
+        val tun = config.getJSONArray("inbounds").getJSONObject(0)
+        assertTrue(tun.getBoolean("sniff"))
+
+        val outboundTypes = (0 until config.getJSONArray("outbounds").length())
+            .map { config.getJSONArray("outbounds").getJSONObject(it).getString("type") }
+        assertTrue("dns" in outboundTypes)
+
+        val rules = config.getJSONObject("route").getJSONArray("rules")
+        val first = rules.getJSONObject(0)
+        val second = rules.getJSONObject(1)
+        assertEquals("dns", first.getString("protocol"))
+        assertEquals("gorebox-dns-out", first.getString("outbound"))
+        assertEquals(53, second.getInt("port"))
+        assertEquals("gorebox-dns-out", second.getString("outbound"))
+        // QUIC-блокировка стоит после DNS-правил
+        assertEquals("udp", rules.getJSONObject(2).getString("network"))
+    }
+
+    @Test
+    fun `bootstraps domain proxy server through direct DNS`() {
+        val config = JSONObject(SingBoxConfigBuilder.build(profile("trojan", "trojan://pw@edge.example:443")))
+        val dns = config.getJSONObject("dns")
+        val servers = dns.getJSONArray("servers")
+        val directServer = (0 until servers.length()).map { servers.getJSONObject(it) }
+            .first { it.getString("tag") == "gorebox-dns-direct" }
+        assertEquals("gorebox-direct", directServer.getString("detour"))
+
+        val bootstrap = dns.getJSONArray("rules").getJSONObject(0)
+        assertEquals("gorebox-dns-direct", bootstrap.getString("server"))
+        assertEquals("edge.example", bootstrap.getJSONArray("domain").getString(0))
+    }
+
+    @Test
+    fun `does not bootstrap IP literal server`() {
+        val config = JSONObject(SingBoxConfigBuilder.build(profile("trojan", "trojan://pw@203.0.113.7:443")))
+        val rules = config.getJSONObject("dns").getJSONArray("rules")
+        for (index in 0 until rules.length()) {
+            assertTrue(!rules.getJSONObject(index).has("domain"))
+        }
+    }
+
+    @Test
+    fun `full JSON config gets DNS outbound, sniff and bootstrap`() {
+        val raw = """{"outbounds":[{"type":"vless","tag":"proxy","server":"full.example","server_port":443,"uuid":"u"}],"route":{"final":"proxy"}}"""
+        val config = JSONObject(SingBoxConfigBuilder.build(profile("vless", raw)))
+        val types = (0 until config.getJSONArray("outbounds").length())
+            .map { config.getJSONArray("outbounds").getJSONObject(it).getString("type") }
+        assertTrue("dns" in types)
+        assertTrue("direct" in types)
+        assertTrue(config.getJSONArray("inbounds").getJSONObject(0).getBoolean("sniff"))
+        val firstRule = config.getJSONObject("route").getJSONArray("rules").getJSONObject(0)
+        assertEquals("dns", firstRule.getString("protocol"))
+        val dnsRules = config.getJSONObject("dns").getJSONArray("rules")
+        assertEquals("full.example", dnsRules.getJSONObject(0).getJSONArray("domain").getString(0))
+    }
+
+    @Test
+    fun `redactForLog masks secrets but keeps structure`() {
+        val config = SingBoxConfigBuilder.build(
+            profile("vless", "vless://123e4567-e89b-12d3-a456-426614174000@edge.example:443?security=reality&pbk=PUBKEY&sid=01&sni=cdn.example"),
+        )
+        val redacted = SingBoxConfigBuilder.redactForLog(config)
+        assertTrue(!redacted.contains("123e4567-e89b-12d3-a456-426614174000"))
+        assertTrue(!redacted.contains("PUBKEY"))
+        assertTrue(redacted.contains("edge.example"))
+        assertTrue(redacted.contains("\"uuid\":\"***\""))
+    }
 }

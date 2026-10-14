@@ -3,8 +3,7 @@ name: Android APK
 on:
   push:
     branches:
-      - "Android"
-      - "arena/03ebb552-goreboxandroid"
+      - "main"
   workflow_dispatch:
 
 permissions:
@@ -139,8 +138,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Keep a downloadable APK archive on the work branch
-        if: github.ref == 'refs/heads/arena/03ebb552-goreboxandroid'
+      - name: Keep a downloadable APK archive on the main branch
+        if: github.ref == 'refs/heads/main'
         run: |
           mkdir -p deliverables
           python3 - <<'PY'
@@ -162,5 +161,5 @@ jobs:
             echo "The branch already contains the current APK archive."
           else
             git commit -m "Add compressed downloadable GoreBox debug APK"
-            git push origin HEAD:refs/heads/arena/03ebb552-goreboxandroid
+            git push origin HEAD:refs/heads/main
           fi

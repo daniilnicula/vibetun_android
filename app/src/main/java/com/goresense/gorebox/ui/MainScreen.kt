@@ -1014,10 +1014,8 @@ private fun SettingsPage(
                     val context = LocalContext.current
                     SecondaryActionButton("Поделиться логами", Icons.Outlined.Share, {
                         AppLog.i("UI", "Пользователь отправил логи")
-                        val logsDir = java.io.File(context.filesDir, "logs")
-                        val logFiles = listOf("gorebox.log", "core.log", "gorebox.log.old", "core.log.old")
-                            .map { name -> java.io.File(logsDir, name) }
-                            .filter { it.exists() && it.length() > 0 }
+                        // Логи всех процессов: UI (gorebox-main), sing-box (gorebox-vpn), AmneziaWG (gorebox-awg), core.log.
+                        val logFiles = AppLog.shareableFiles(context)
                         if (logFiles.isEmpty()) {
                             Toast.makeText(context, "Лог-файлы ещё не созданы", Toast.LENGTH_SHORT).show()
                             return@SecondaryActionButton

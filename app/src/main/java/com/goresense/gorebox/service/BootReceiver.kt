@@ -4,7 +4,6 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
-import androidx.core.content.ContextCompat
 import com.goresense.gorebox.data.GoreBoxStore
 
 /**
@@ -18,8 +17,7 @@ class BootReceiver : BroadcastReceiver() {
         val store = GoreBoxStore(context)
         if (!store.launchAtBoot || !store.proxyWasActive) return
         if (VpnService.prepare(context) != null) return
-        val serviceIntent = Intent(context, GoreBoxVpnService::class.java)
-            .setAction(GoreBoxVpnService.ACTION_START)
-        runCatching { ContextCompat.startForegroundService(context, serviceIntent) }
+        val profile = store.loadProfiles().firstOrNull { it.id == store.selectedProfileId } ?: return
+        runCatching { VpnServiceLauncher.start(context, profile) }
     }
 }

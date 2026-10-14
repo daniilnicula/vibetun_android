@@ -54,6 +54,14 @@
             </intent-filter>
         </service>
 
+        <!-- AmneziaWG (libwg-go) и sing-box (libbox) — разные Go-runtime: каждому свой процесс. -->
+        <service
+            android:name=".service.GoreBoxAwgVpnService"
+            android:exported="true"
+            android:foregroundServiceType="systemExempted"
+            android:process=":vpn_awg"
+            android:permission="android.permission.BIND_VPN_SERVICE" />
+
         <receiver
             android:name=".service.BootReceiver"
             android:exported="true">
