@@ -14,6 +14,8 @@ object SingBoxConfigBuilder {
     private const val DNS_TAG = "vibetun-dns"
     private const val DIRECT_TAG = "vibetun-direct"
     private const val DNS_DIRECT_TAG = "vibetun-dns-direct"
+    /** Резолвер домена DoH-сервера: IP-литерал, поэтому сам резолвер не нужен. */
+    private const val DNS_DIRECT_RESOLVER_TAG = "vibetun-dns-direct-resolver"
     private const val BLOCK_TAG = "vibetun-block"
     /** Outbound типа dns: сюда уходят DNS-запросы из TUN (перехват для sing-box < 1.11). */
     private const val DNS_OUT_TAG = "vibetun-dns-out"
@@ -259,7 +261,12 @@ object SingBoxConfigBuilder {
         if (!dns.has("reverse_mapping")) dns.put("reverse_mapping", true)
         val servers = dns.optJSONArray("servers") ?: JSONArray().also { dns.put("servers", it) }
         val hasDirectServer = (0 until servers.length()).any { servers.optJSONObject(it)?.optString("tag") == DNS_DIRECT_TAG }
-        if (!hasDirectServer) servers.put(directDnsServer())
+        if (!hasDirectServer) {
+            // resolver добавляем вместе с direct-сервером атомарно: у directDnsServer()
+            // address_resolver обязателен (DoH по доменному адресу), без него ядро отклоняет конфиг.
+            servers.put(directDnsResolver())
+            servers.put(directDnsServer())
+        }
         val rules = dns.optJSONArray("rules") ?: JSONArray()
         val merged = JSONArray()
         bootstrapDnsRule(serverHosts)?.let { merged.put(it) }
@@ -337,9 +344,16 @@ object SingBoxConfigBuilder {
     // НЕ «local»: на Android он ходит в системный DNS аплинка, который бывает сломан
     // (логи: exchange failed ... name error для ozon.ru) и не умеет HTTPS-записи
     // (no raw query support by current transport). Яндекс-DoH идёт напрямую и стабилен.
+    // Домен DoH-сервера резолвится через address_resolver с IP-литералом (требование sing-box).
     private fun directDnsServer(): JSONObject = JSONObject()
         .put("tag", DNS_DIRECT_TAG)
         .put("address", "https://common.dot.dns.yandex.net/dns-query")
+        .put("address_resolver", DNS_DIRECT_RESOLVER_TAG)
+        .put("detour", DIRECT_TAG)
+
+    private fun directDnsResolver(): JSONObject = JSONObject()
+        .put("tag", DNS_DIRECT_RESOLVER_TAG)
+        .put("address", "77.88.8.8")
         .put("detour", DIRECT_TAG)
 
     /** Всегда есть прямой DNS: без него доменный адрес сервера резолвится через ещё не поднятый прокси. */
@@ -350,6 +364,7 @@ object SingBoxConfigBuilder {
                 .put("address", "https://1.1.1.1/dns-query")
                 .put("detour", PROXY_TAG),
         )
+        put(directDnsResolver())
         put(directDnsServer())
     }
 
