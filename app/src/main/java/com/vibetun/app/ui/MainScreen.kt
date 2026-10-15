@@ -88,6 +88,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -717,21 +718,21 @@ private fun RoutingPage(
                     modifier = Modifier.padding(top = 8.dp),
                 )
 
-                // строка добавления: [поле ввода] [PROXY] [DIRECT] [Добавить]
-                Row(Modifier.padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedTextField(
-                        value = ruleInput,
-                        onValueChange = { ruleInput = it },
-                        placeholder = { Text("Домен, IP или ключевое слово", fontSize = 11.sp) },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Spacer(Modifier.width(7.dp))
+                // строка добавления: поле ввода на всю ширину, под ним три равные кнопки
+                OutlinedTextField(
+                    value = ruleInput,
+                    onValueChange = { ruleInput = it },
+                    placeholder = { Text("Домен, IP или ключевое слово", fontSize = 11.sp) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                )
+                Row(Modifier.fillMaxWidth().padding(top = 7.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     listOf(RouteAction.PROXY, RouteAction.DIRECT).forEach { action ->
                         val selected = ruleAction == action
                         Surface(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
+                                .weight(1f)
+                                .clip(RoundedCornerShape(7.dp))
                                 .clickable { ruleAction = action },
                             color = if (selected) (if (action == RouteAction.DIRECT) p.warningSoft else p.accentSoft) else p.cardAlt,
                             border = BorderStroke(1.dp, if (selected) (if (action == RouteAction.DIRECT) p.warning else p.accent) else p.border),
@@ -739,16 +740,17 @@ private fun RoutingPage(
                             Text(
                                 if (action == RouteAction.DIRECT) "DIRECT" else "PROXY",
                                 color = if (selected) (if (action == RouteAction.DIRECT) p.warning else p.accent) else p.textMuted,
-                                fontSize = 9.sp,
+                                fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                             )
                         }
-                        Spacer(Modifier.width(5.dp))
                     }
                     Surface(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
+                            .weight(1f)
+                            .clip(RoundedCornerShape(7.dp))
                             .clickable {
                                 viewModel.addRouteRule(ruleInput, ruleAction)
                                 ruleInput = ""
@@ -757,12 +759,13 @@ private fun RoutingPage(
                         border = BorderStroke(1.dp, p.accent),
                     ) {
                         Row(
+                            horizontalArrangement = Arrangement.Center,
                             verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                         ) {
-                            Icon(Icons.Outlined.Add, contentDescription = null, tint = p.accent, modifier = Modifier.size(12.dp))
-                            Spacer(Modifier.width(3.dp))
-                            Text("Добавить", color = p.accent, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                            Icon(Icons.Outlined.Add, contentDescription = null, tint = p.accent, modifier = Modifier.size(13.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("Добавить", color = p.accent, fontSize = 10.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                         }
                     }
                 }
