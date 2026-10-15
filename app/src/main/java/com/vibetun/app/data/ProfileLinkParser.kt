@@ -169,8 +169,11 @@ object ProfileLinkParser {
         val amnezia = Regex(
             "(?im)^\\s*(?:Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5]|HeaderProtectionKey|ContentPaddingAddition|RandomTrailers|DisableCookies)\\s*=",
         ).containsMatchIn(raw)
-        val protocol = if (amnezia) "amneziawg" else "wireguard"
-        return profile(if (amnezia) "AmneziaWG" else "WireGuard", protocol, "", 0, raw)
+        // Всегда amneziawg: движок AmneziaWG обратно совместим с чистым WireGuard
+        // (без Jc/Jmin/... в UAPI уходит стандартный WG-handshake), а sing-box-путь
+        // для WG-INI не поддержан — протокол «wireguard» уходил бы в чужую службу и ломался.
+        // Так 3x-ui-подписки с vpn:// (обычный WG-конфиг) подключаются через AWG-ядро.
+        return profile(if (amnezia) "AmneziaWG" else "WireGuard", "amneziawg", "", 0, raw)
     }
 
     private fun parseAuthority(address: String): Pair<String, Int> {

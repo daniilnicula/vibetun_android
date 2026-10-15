@@ -38,6 +38,27 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         private set
     var launchAtBoot by mutableStateOf(store.launchAtBoot)
         private set
+
+    // ==================== обновления ====================
+    var updateChecking by mutableStateOf(false)
+        private set
+    var updateDownloading by mutableStateOf(false)
+        private set
+    var updateProgress by mutableStateOf(0)
+        private set
+    /** Релиз, доступный к установке; диалог с описанием висит, пока не null. */
+    var updateAvailable by mutableStateOf<UpdateManager.Release?>(null)
+    /** Однострочный статус под кнопкой («Установлена актуальная версия», ошибки). */
+    var updateStatusLine by mutableStateOf<String?>(null)
+    /** Скачанный APK, ожидающий запуска системного установщика (забирает UI). */
+    var pendingInstallApk by mutableStateOf<java.io.File?>(null)
+
+    // ==================== подписки (одноразовый импорт по URL) ====================
+    /** URL подписки из диалога импорта; пока не null — показываем диалог подтверждения. */
+    var pendingSubscriptionUrl by mutableStateOf<String?>(null)
+    var subscriptionLoading by mutableStateOf(false)
+        private set
+    var subscriptionError by mutableStateOf<String?>(null)
     /** Цвет акцента (ARGB); 0 — акцент по умолчанию для текущей темы. Хранится навсегда. */
     var accentColorArgb by mutableStateOf(store.accentColorArgb)
         private set
@@ -116,6 +137,11 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         get() = !batteryOptimizationExempt
 
     fun importText(text: String): Int {
+        // Ссылка-подписка (3x-ui /sub/...): не парсим как текст, предлагаем скачать.
+        if (isSubscriptionUrl(text)) {
+            pendingSubscriptionUrl = text.trim()
+            return 0
+        }
         val result = ProfileLinkParser.parseMany(text)
         if (result.profiles.isNotEmpty()) {
             val existingSources = profiles.map { it.source }.toSet()
@@ -132,6 +158,113 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         }
         return result.profiles.size
     }
+
+    /** Одна строка, начинающаяся с http(s):// — считаем ссылкой-подпиской. */
+    private fun isSubscriptionUrl(text: String): Boolean {
+        val trimmed = text.trim()
+        return !trimmed.contains('\n') &&
+            (trimmed.startsWith("https://") || trimmed.startsWith("http://"))
+    }
+
+    /** Загрузка подписки и добавление распарсенных профилей (без дублей по source). */
+    fun fetchSubscription(url: String, allowInsecure: Boolean) {
+        if (subscriptionLoading) return
+        subscriptionLoading = true
+        subscriptionError = null
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { SubscriptionFetcher.fetch(url, allowInsecure) } }
+                .onSuccess { payload ->
+                    val result = ProfileLinkParser.parseMany(payload)
+                    if (result.profiles.isEmpty()) {
+                        subscriptionError = "В подписке не найдено поддерживаемых профилей."
+                        return@onSuccess
+                    }
+                    val existingSources = profiles.map { it.source }.toSet()
+                    val newProfiles = result.profiles.filterNot { it.source in existingSources }
+                    profiles.addAll(newProfiles)
+                    if (selectedProfileId.isBlank() && profiles.isNotEmpty()) selectProfile(profiles.first().id)
+                    persistProfiles()
+                    val skipped = result.profiles.size - newProfiles.size
+                    feedback = if (skipped > 0) {
+                        "Добавлено из подписки: ${newProfiles.size} (дублей пропущено: $skipped)"
+                    } else {
+                        "Добавлено из подписки: ${newProfiles.size}"
+                    }
+                    pendingSubscriptionUrl = null
+                }
+                .onFailure { subscriptionError = "Не удалось загрузить подписку: ${it.message}" }
+            subscriptionLoading = false
+        }
+    }
+
+    fun dismissSubscription() {
+        pendingSubscriptionUrl = null
+        subscriptionError = null
+    }
+
+    // ==================== обновления ====================
+
+    private fun currentVersionName(): String = runCatching {
+        val app = getApplication<Application>()
+        @Suppress("DEPRECATION")
+        app.packageManager.getPackageInfo(app.packageName, 0).versionName
+    }.getOrNull().orEmpty()
+
+    /** Проверка релизов на GitHub. Результат — диалог [updateAvailable] или строка статуса. */
+    fun checkForUpdates() {
+        if (updateChecking || updateDownloading) return
+        updateChecking = true
+        updateStatusLine = null
+        updateAvailable = null
+        viewModelScope.launch {
+            runCatching { withContext(Dispatchers.IO) { UpdateManager.fetchLatest() } }
+                .onSuccess { release ->
+                    updateStatusLine = if (UpdateManager.isUpdateAvailable(release.tag, currentVersionName())) {
+                        updateAvailable = release
+                        "Доступна версия ${release.tag}"
+                    } else {
+                        "Установлена актуальная версия (${currentVersionName()})"
+                    }
+                }
+                .onFailure { updateStatusLine = "Не удалось проверить обновления: ${it.message}" }
+            updateChecking = false
+        }
+    }
+
+    fun dismissUpdate() {
+        updateAvailable = null
+    }
+
+    /** Скачивание APK выбранного релиза; по завершении UI запускает системный установщик. */
+    fun downloadAndInstallUpdate() {
+        val release = updateAvailable ?: return
+        if (updateDownloading) return
+        updateDownloading = true
+        updateProgress = 0
+        updateStatusLine = null
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    UpdateManager.download(getApplication(), release.apkUrl) { percent -> updateProgress = percent }
+                }
+            }
+                .onSuccess { apk ->
+                    pendingInstallApk = apk
+                    updateAvailable = null
+                }
+                .onFailure { updateStatusLine = "Не удалось скачать обновление: ${it.message}" }
+            updateDownloading = false
+        }
+    }
+
+    fun consumePendingInstall(): java.io.File? {
+        val apk = pendingInstallApk
+        pendingInstallApk = null
+        return apk
+    }
+
+    /** Подпись в футере настроек: текущая versionName (из CI) либо dev-метка. */
+    fun appVersionLabel(): String = currentVersionName().ifBlank { "dev" }
 
     fun saveEditedProfile(profileId: String, name: String, source: String) {
         val old = profiles.firstOrNull { it.id == profileId } ?: return

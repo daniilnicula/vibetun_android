@@ -49,6 +49,8 @@ import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material.icons.outlined.SystemUpdateAlt
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.Upload
 import androidx.compose.material3.AlertDialog
@@ -58,6 +60,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -98,6 +101,7 @@ import com.vibetun.app.data.AppLog
 import com.vibetun.app.R
 import com.vibetun.app.data.AppTab
 import com.vibetun.app.data.ConnectionState
+import com.vibetun.app.data.UpdateManager
 import com.vibetun.app.data.VibeTunViewModel
 import com.vibetun.app.data.InstalledApp
 import com.vibetun.app.data.ProtocolCatalog
@@ -203,6 +207,24 @@ fun VibeTunRoot(
                 viewModel.importText(text)
                 showImportDialog = false
             },
+        )
+    }
+    viewModel.updateAvailable?.let { release ->
+        UpdateAvailableDialog(
+            release = release,
+            downloading = viewModel.updateDownloading,
+            progress = viewModel.updateProgress,
+            onDismiss = { viewModel.dismissUpdate() },
+            onDownload = { viewModel.downloadAndInstallUpdate() },
+        )
+    }
+    viewModel.pendingSubscriptionUrl?.let { url ->
+        SubscriptionImportDialog(
+            url = url,
+            loading = viewModel.subscriptionLoading,
+            error = viewModel.subscriptionError,
+            onDismiss = { viewModel.dismissSubscription() },
+            onFetch = { allowInsecure -> viewModel.fetchSubscription(url, allowInsecure) },
         )
     }
     editingProfile?.let { profile ->
@@ -992,6 +1014,7 @@ private fun SettingsPage(
 ) {
     LaunchedEffect(Unit) { onBatteryStatusRefresh() }
     val p = LocalGorePalette.current
+    val context = LocalContext.current
     Column(
         Modifier
             .fillMaxSize()
@@ -1152,9 +1175,61 @@ private fun SettingsPage(
                     lineHeight = 16.sp,
                     modifier = Modifier.padding(top = 9.dp),
                 )
-                Text("VibeTun Android · 0.1.0", color = p.textMuted, fontSize = 9.sp, modifier = Modifier.padding(top = 12.dp))
+                Text("VibeTun Android · ${viewModel.appVersionLabel()}", color = p.textMuted, fontSize = 9.sp, modifier = Modifier.padding(top = 12.dp))
             }
         }
+
+        // Обновление — всегда последний раздел настроек.
+        PanelCard(Modifier.fillMaxWidth().padding(bottom = 17.dp)) {
+            Column(Modifier.padding(15.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.SystemUpdateAlt, contentDescription = null, tint = p.accent, modifier = Modifier.size(19.dp))
+                    Column(Modifier.padding(start = 9.dp)) {
+                        Text("Обновление", color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Установка новых версий поверх текущей", color = p.textMuted, fontSize = 10.sp, modifier = Modifier.padding(top = 3.dp))
+                    }
+                }
+                Row(Modifier.padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                    SecondaryActionButton(
+                        if (viewModel.updateChecking) "Проверяем…" else "Проверить обновления",
+                        Icons.Outlined.Refresh,
+                        onClick = { viewModel.checkForUpdates() },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+                if (viewModel.updateDownloading) {
+                    Text(
+                        "Скачивание обновления… ${viewModel.updateProgress}%",
+                        color = p.textSecondary,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(top = 10.dp),
+                    )
+                    LinearProgressIndicator(
+                        progress = { viewModel.updateProgress / 100f },
+                        modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                        color = p.accent,
+                        trackColor = p.cardAlt,
+                    )
+                }
+                viewModel.updateStatusLine?.let { status ->
+                    Text(
+                        status,
+                        color = if (status.startsWith("Доступна")) p.success else p.textMuted,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(top = 10.dp),
+                    )
+                }
+            }
+        }
+    }
+
+    // Скачанное обновление отдаём системному установщику (стандартный диалог установки).
+    val pendingInstall = viewModel.pendingInstallApk
+    LaunchedEffect(pendingInstall) {
+        val apk = pendingInstall ?: return@LaunchedEffect
+        runCatching { context.startActivity(UpdateManager.installIntent(context, apk)) }
+            .onFailure { Toast.makeText(context, "Не удалось открыть установщик: ${it.message}", Toast.LENGTH_LONG).show() }
+        viewModel.consumePendingInstall()
     }
 }
 
@@ -1557,6 +1632,146 @@ private fun ConfirmRemoveDialog(profileName: String, onDismiss: () -> Unit, onRe
         text = { Text("Профиль «$profileName» будет удалён с этого устройства.", fontSize = 12.sp) },
         confirmButton = { TextButton(onClick = onRemove) { Text("Удалить", color = p.danger, fontWeight = FontWeight.SemiBold) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена", color = p.textSecondary) } },
+    )
+}
+
+/** Диалог доступного обновления: описание релиза + скачивание с прогрессом. */
+@Composable
+private fun UpdateAvailableDialog(
+    release: UpdateManager.Release,
+    downloading: Boolean,
+    progress: Int,
+    onDismiss: () -> Unit,
+    onDownload: () -> Unit,
+) {
+    val p = LocalGorePalette.current
+    AlertDialog(
+        onDismissRequest = { if (!downloading) onDismiss() },
+        shape = RoundedCornerShape(14.dp),
+        containerColor = p.panel,
+        titleContentColor = p.text,
+        textContentColor = p.textSecondary,
+        title = { Text("Доступна версия ${release.tag}", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
+        text = {
+            Column {
+                val notes = release.notes.trim()
+                if (notes.isNotBlank()) {
+                    Text(
+                        notes.take(1500),
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(p.cardAlt)
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                    )
+                    Spacer(Modifier.height(8.dp))
+                }
+                if (downloading) {
+                    Text("Скачивание… $progress%", fontSize = 11.sp, color = p.textSecondary)
+                    Spacer(Modifier.height(6.dp))
+                    LinearProgressIndicator(
+                        progress = { progress / 100f },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = p.accent,
+                        trackColor = p.cardAlt,
+                    )
+                } else {
+                    Text(
+                        "Обновление установится поверх текущей версии, профили и настройки сохранятся.",
+                        fontSize = 11.sp,
+                        lineHeight = 15.sp,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDownload, enabled = !downloading) {
+                Text(
+                    if (downloading) "Скачивание…" else "Скачать и установить",
+                    color = if (downloading) p.textMuted else p.accent,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !downloading) { Text("Позже", color = p.textSecondary) }
+        },
+    )
+}
+
+/** Диалог одноразового импорта подписки по URL (3x-ui /sub/...). */
+@Composable
+private fun SubscriptionImportDialog(
+    url: String,
+    loading: Boolean,
+    error: String?,
+    onDismiss: () -> Unit,
+    onFetch: (allowInsecure: Boolean) -> Unit,
+) {
+    val p = LocalGorePalette.current
+    var allowInsecure by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = { if (!loading) onDismiss() },
+        shape = RoundedCornerShape(14.dp),
+        containerColor = p.panel,
+        titleContentColor = p.text,
+        textContentColor = p.textSecondary,
+        title = { Text("Подписка", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
+        text = {
+            Column {
+                Text(
+                    "По ссылке будет загружен список профилей и добавлен в приложение.",
+                    fontSize = 11.sp,
+                    lineHeight = 15.sp,
+                )
+                Text(
+                    url.take(64) + if (url.length > 64) "…" else "",
+                    color = p.textMuted,
+                    fontSize = 10.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(7.dp))
+                        .clickable(enabled = !loading) { allowInsecure = !allowInsecure }
+                        .padding(top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = allowInsecure,
+                        onCheckedChange = { allowInsecure = it },
+                        enabled = !loading,
+                        colors = CheckboxDefaults.colors(checkedColor = p.warning, uncheckedColor = p.border),
+                    )
+                    Text(
+                        "Не проверять TLS-сертификат (самоподписанный)\nОпасно: трафик подписки можно перехватить",
+                        fontSize = 10.sp,
+                        lineHeight = 13.sp,
+                        color = if (allowInsecure) p.warning else p.textSecondary,
+                    )
+                }
+                error?.let {
+                    Text(it, color = p.danger, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onFetch(allowInsecure) }, enabled = !loading) {
+                Text(
+                    if (loading) "Загрузка…" else "Загрузить профили",
+                    color = if (loading) p.textMuted else p.accent,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss, enabled = !loading) { Text("Отмена", color = p.textSecondary) }
+        },
     )
 }
 

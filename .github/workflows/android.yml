@@ -56,9 +56,25 @@ jobs:
       - name: Build libbox AAR
         if: steps.native-cache.outputs.cache-hit != 'true'
         run: bash ./scripts/build-libbox-android.sh
+      - name: Version from release tag
+        run: |
+          # Тег 26.10.15v5 -> versionCode 261015005 ((YY*100+MM)*100+DD)*1000+N, монотонно растёт,
+          # влезает в int), versionName = сам тег. Сборки ветки без тега — dev-версия по номеру прогона.
+          CODE="$GITHUB_RUN_NUMBER"
+          NAME="0.1.0-dev.$GITHUB_RUN_NUMBER"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            if [[ "$TAG" =~ ^([0-9]{2})\.([0-9]{2})\.([0-9]{2})v([0-9]{1,3})$ ]]; then
+              CODE=$(( ((10#${BASH_REMATCH[1]} * 100 + 10#${BASH_REMATCH[2]}) * 100 + 10#${BASH_REMATCH[3]}) * 1000 + 10#${BASH_REMATCH[4]} ))
+              NAME="$TAG"
+            fi
+          fi
+          echo "VERSION_CODE=$CODE" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$NAME" >> "$GITHUB_ENV"
+          echo "versionCode=$CODE versionName=$NAME"
       - name: Assemble debug APK
         run: |
-          if bash ./gradlew assembleDebug --no-daemon > "$RUNNER_TEMP/gradle.log" 2>&1; then
+          if bash ./gradlew assembleDebug --no-daemon -PversionCode="$VERSION_CODE" -PversionName="$VERSION_NAME" > "$RUNNER_TEMP/gradle.log" 2>&1; then
             tail -n 60 "$RUNNER_TEMP/gradle.log"
           else
             tail -n 100 "$RUNNER_TEMP/gradle.log"
