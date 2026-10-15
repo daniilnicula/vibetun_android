@@ -29,12 +29,31 @@ data class RouteRule(
             return when {
                 IPV4.matches(value) || (value.contains(':') && IPV6.matches(value)) -> RouteRuleType.IP_CIDR
                 DOMAIN.matches(value) -> RouteRuleType.DOMAIN_SUFFIX
+                // «.io» / «*.io»: пользователь имеет в виду весь домен верхнего уровня
+                // (после снятия префикса «io» не проходит DOMAIN — там нужна точка,
+                // поэтому проверяем остаток и как домен, и как одиночную метку).
+                (value.startsWith('.') || value.startsWith("*.")) && (
+                    DOMAIN.matches(value.removePrefix("*.").removePrefix(".")) ||
+                        value.removePrefix("*.").removePrefix(".").all { it.isLetterOrDigit() || it == '-' }
+                    ) -> RouteRuleType.DOMAIN_SUFFIX
+                // «io», «ru», «com»: короткая одна метка — это TLD-суффикс, а не ключевое слово;
+                // иначе «io» уходило в domain_regex и не ловило 2ip.io как суффикс.
+                value.length in 2..3 && value.all { it.isLetter() } -> RouteRuleType.DOMAIN_SUFFIX
                 else -> RouteRuleType.KEYWORD
             }
         }
 
-        /** keyword → литеральный regex для domain_regex ядра. */
-        fun keywordRegex(keyword: String): String = "\\Q" + keyword.trim() + "\\E"
+        /**
+         * keyword → литеральный regex для domain_regex ядра.
+         * Go-regexp (RE2-синтаксис в sing-box) НЕ поддерживает \Q…\E — такое выражение
+         * отклоняется при разборе правила; экранируем метасимволы вручную.
+         */
+        fun keywordRegex(keyword: String): String = buildString {
+            keyword.trim().forEach { ch ->
+                if (ch in "\\.+*?()|[]{}^$") append('\\')
+                append(ch)
+            }
+        }
     }
 }
 
@@ -97,3 +116,10 @@ class RouteSetStore(context: Context) {
         fun isValidValue(value: String): Boolean = value.isNotBlank() && !value.contains('\n')
     }
 }
+
+/**
+ * Выбор активного набора маршрутов: сохранённое имя приоритетно, fallback на первый
+ * по алфавиту. Вынесено в чистую функцию для юнит-тестирования без Android-контекста.
+ */
+fun resolveActiveRouteSet(saved: String, available: List<String>): String =
+    if (saved.isNotBlank() && saved in available) saved else available.firstOrNull().orEmpty()

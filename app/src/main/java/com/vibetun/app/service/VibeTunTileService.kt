@@ -7,8 +7,10 @@ import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import com.vibetun.app.MainActivity
+import com.vibetun.app.data.ConnectionAction
 import com.vibetun.app.data.ConnectionState
 import com.vibetun.app.data.VibeTunStore
+import com.vibetun.app.data.actionOnTap
 
 class VibeTunTileService : TileService() {
     private val stateStore by lazy { ConnectionStateStore(this) }
@@ -20,12 +22,24 @@ class VibeTunTileService : TileService() {
 
     override fun onClick() {
         super.onClick()
-        val state = stateStore.state
-        if (state == ConnectionState.RUNNING) {
-            VpnServiceLauncher.stop(this)
-            stateStore.update(ConnectionState.STOPPED)
-            updateTileState()
-            return
+        when (stateStore.state.actionOnTap()) {
+            ConnectionAction.STOP -> {
+                // Остановку выполняет служба (закрывает ядро и TUN) и только она пишет STOPPED:
+                // плитка раньше сразу ставила STOPPED, поэтому «Выключен» показывался, пока
+                // VPN-ключ в шторке и туннель были живы.
+                stateStore.update(ConnectionState.STOPPING, "Отключаемся…")
+                VpnServiceLauncher.stop(this)
+                StopWatchdog.arm(this)
+                updateTileState()
+                return
+            }
+            // Пока идёт остановка или запуск, тап ничего не меняет: иначе stop и start гоняются,
+            // и запоздавшая остановка убивает только что запущенную службу.
+            ConnectionAction.IGNORE -> {
+                updateTileState()
+                return
+            }
+            ConnectionAction.CONNECT -> Unit
         }
 
         // VPN consent is an Activity result, so the tile hands off to VibeTun when consent
@@ -66,11 +80,15 @@ class VibeTunTileService : TileService() {
         if (stateStore.state == ConnectionState.STARTING && stateStore.ageMs > ConnectionStateStore.START_TIMEOUT_MS) {
             stateStore.update(ConnectionState.ERROR, "VPN-служба не ответила. Пришлите логи (Настройки → Логи).")
             VpnServiceLauncher.stop(this)
+            StopWatchdog.arm(this)
         }
+        // Зависшее STOPPING: служба не подтвердила остановку за 6 с — гасим её процесс,
+        // иначе VPN-ключ в шторке может остаться.
+        StopWatchdog.forceStopIfStuck(this)
         val state = stateStore.state
         tile.state = when (state) {
             ConnectionState.RUNNING -> Tile.STATE_ACTIVE
-            ConnectionState.STARTING -> Tile.STATE_UNAVAILABLE
+            ConnectionState.STARTING, ConnectionState.STOPPING -> Tile.STATE_UNAVAILABLE
             ConnectionState.STOPPED, ConnectionState.ERROR -> Tile.STATE_INACTIVE
         }
         tile.label = "VibeTun"
@@ -78,10 +96,15 @@ class VibeTunTileService : TileService() {
             tile.subtitle = when {
                 !NativeCoreStatus.isIntegrated -> "Ядро не подключено"
                 state == ConnectionState.RUNNING -> "Включён"
+                state == ConnectionState.STOPPING -> "Отключаемся…"
                 else -> "Выключен"
             }
             tile.stateDescription = stateStore.message.takeIf { it.isNotBlank() }
-                ?: if (state == ConnectionState.RUNNING) "Прокси включён" else "Прокси выключен"
+                ?: when (state) {
+                    ConnectionState.RUNNING -> "Прокси включён"
+                    ConnectionState.STOPPING -> "Отключаемся…"
+                    else -> "Прокси выключен"
+                }
         }
         tile.updateTile()
     }

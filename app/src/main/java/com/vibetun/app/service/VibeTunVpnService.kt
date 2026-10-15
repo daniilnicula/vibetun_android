@@ -16,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.os.SystemClock
 import android.system.OsConstants
 import android.util.Log
@@ -51,6 +52,7 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Android VpnService hosting the bundled sing-box/libbox data plane.
@@ -73,6 +75,16 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     @Volatile private var amneziaHandle: Int = NO_AMNEZIA_HANDLE
     @Volatile private var tunDescriptor: ParcelFileDescriptor? = null
     @Volatile private var lastStoppedAtMs: Long = 0L
+
+    /** Остановка в процессе: повторные ACTION_STOP игнорируются, старт — ставится в очередь. */
+    private val stopping = AtomicBoolean(false)
+
+    /** Пришёл ACTION_START, пока закрывалось ядро: процесс не гасим, а подключаемся заново. */
+    @Volatile private var startRequestedWhileStopping: Boolean = false
+
+    /** Защита от параллельного закрытия ядра (stop + onDestroy + fail). */
+    private val closeLock = Any()
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val endpointResolver = Executors.newSingleThreadExecutor { task ->
         Thread(task, "VibeTun-AWG-DNS").apply { isDaemon = true }
@@ -84,48 +96,118 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val action = intent?.action ?: ACTION_START
-        AppLog.i(TAG, "onStartCommand action=$action")
-        // startForegroundService обязывает вызвать startForeground в течение 5 с. Поэтому поднимаем
-        // уведомление сразу, ДО любых проверок (VPN-разрешение, ядро, профиль): иначе ранний fail()
-        // даёт ForegroundServiceDidNotStartInTimeException.
-        if (action == ACTION_START || action == ACTION_TOGGLE) {
-            promoteToForeground(intent?.getStringExtra(EXTRA_PROFILE_ID))
+        val action = intent?.action
+        AppLog.i(TAG, "onStartCommand action=${action ?: "null"} startId=$startId pid=${Process.myPid()}")
+
+        // Системный запуск (не наша команда): состояние VPN НЕ запоминаем и не восстанавливаем.
+        // Если приложение полностью закрыли/выгрузили из памяти, VPN должен остаться выключенным,
+        // а не подниматься заново после рестарта процесса или устройства.
+        if (action == null || action == VpnService.SERVICE_INTERFACE) {
+            AppLog.i(TAG, "onStartCommand: системный запуск — VPN не восстанавливаем, служба не нужна")
+            profileStore.proxyWasActive = false
+            satisfyForegroundObligation()
+            stopSelf(startId)
+            return START_NOT_STICKY
         }
+
         when (action) {
-            ACTION_STOP -> stopConnection()
-            ACTION_TOGGLE -> if (isProxyActive()) stopConnection() else {
-                scheduleStart()
-                armStartWatchdog()
+            ACTION_STOP -> {
+                // startForegroundService обязывает вызвать startForeground в течение 5 с, иначе
+                // ForegroundServiceDidNotStartInTimeException. Поэтому — всегда, до любых проверок.
+                promoteToForeground(null, STOP_NOTIFICATION_TEXT)
+                stopConnection("ACTION_STOP")
+            }
+            ACTION_FORCE_KILL -> {
+                // Последнее средство: ядро (или его close()) не отвечает — смерть процесса
+                // гарантированно закрывает все fd TUN, включая дубликат из libbox.
+                promoteToForeground(null, STOP_NOTIFICATION_TEXT)
+                AppLog.e(TAG, "ACTION_FORCE_KILL: принудительное завершение процесса pid=${Process.myPid()}")
+                profileStore.proxyWasActive = false
+                Process.killProcess(Process.myPid())
+            }
+            ACTION_TOGGLE -> {
+                // Новый запрос жизни отменяет отложенное убийство процесса: иначе при частом
+                // переподключении kill по таймеру убивал только что запрошенный старт, и UI
+                // навсегда оставался в «Поднимаем туннель…», хотя службы уже не было.
+                mainHandler.removeCallbacks(killProcessRunnable)
+                // startForegroundService обязывает поднять уведомление в течение 5 с — делаем это
+                // до любых проверок, даже если сейчас пойдёт остановка.
+                promoteToForeground(intent?.getStringExtra(EXTRA_PROFILE_ID))
+                if (stopping.get()) {
+                    AppLog.i(TAG, "ACTION_TOGGLE во время остановки — игнорируем")
+                } else if (isProxyActive()) {
+                    stopConnection("ACTION_TOGGLE")
+                } else {
+                    scheduleStart()
+                    armStartWatchdog()
+                }
             }
             ACTION_START -> {
+                // Отменяем отложенное убийство процесса (см. ACTION_TOGGLE): частые
+                // переподключения попадали ровно в это окно, и старт терялся вместе с процессом.
+                mainHandler.removeCallbacks(killProcessRunnable)
+                // startForegroundService обязывает вызвать startForeground в течение 5 с. Поэтому
+                // поднимаем уведомление сразу, ДО любых проверок (VPN-разрешение, ядро, профиль):
+                // иначе ранний fail() даёт ForegroundServiceDidNotStartInTimeException.
+                promoteToForeground(intent?.getStringExtra(EXTRA_PROFILE_ID))
                 // Явный старт при активном подключении = пользователь сменил профиль.
                 // Раньше старт молча проглатывался (isProxyActive -> return), UI вис в
                 // «Подключаемся…», а старый туннель продолжал работать.
+                requestedProfileId = intent?.getStringExtra(EXTRA_PROFILE_ID)?.takeIf { it.isNotBlank() }
+                if (stopping.get()) {
+                    // Остановка уже идёт. Процесс :vpn/:vpn_awg выделен под одно ядро и после
+                    // закрытия будет убит, поэтому запрос старта нельзя выполнять сразу — он
+                    // потерялся бы вместе с процессом. Запоминаем и стартуем после teardown.
+                    AppLog.i(TAG, "ACTION_START во время остановки — стартуем сразу после закрытия ядра")
+                    startRequestedWhileStopping = true
+                    return START_NOT_STICKY
+                }
                 if (isProxyActive()) {
                     AppLog.i(TAG, "ACTION_START при активном подключении — перезапуск с выбранным профилем")
-                    // Останавливаем только ядро, но НЕ саму службу: stopSelf() здесь приводил к onDestroy,
-                    // который сбрасывал отложенный старт (removeCallbacksAndMessages) — UI вис в «Подключаемся…».
-                    mainHandler.removeCallbacksAndMessages(null)
-                    closeNativeService()
-                    lastStoppedAtMs = SystemClock.elapsedRealtime()
+                    restartWithSelectedProfile()
+                } else {
+                    scheduleStart()
+                    armStartWatchdog()
                 }
-                requestedProfileId = intent?.getStringExtra(EXTRA_PROFILE_ID)?.takeIf { it.isNotBlank() }
-                scheduleStart()
-                armStartWatchdog()
             }
-            else -> stopSelf(startId)
+            else -> {
+                // Неизвестная команда: работы нет, но обязательство startForegroundService
+                // (startForeground в течение 5 с) всё равно нужно снять.
+                AppLog.i(TAG, "onStartCommand: неизвестное действие ($action) — служба не нужна")
+                satisfyForegroundObligation()
+                stopSelf(startId)
+            }
         }
-        return START_STICKY
+        // START_NOT_STICKY: система не должна перезапускать службу после kill процесса —
+        // иначе она поднимет VPN заново (см. обработку action == null выше).
+        return START_NOT_STICKY
     }
 
-    private fun promoteToForeground(profileId: String?) {
+    /**
+     * Снимает обязательство startForegroundService (startForeground в течение 5 с) для случая,
+     * когда команда получена, но работы для службы нет.
+     */
+    private fun satisfyForegroundObligation() {
+        promoteToForeground(null, STOP_NOTIFICATION_TEXT)
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+    }
+
+    private fun promoteToForeground(profileId: String?, contentText: String? = null) {
         createNotificationChannel()
-        val notification = buildNotification(profileId)
+        val notification = buildNotification(profileId, contentText)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+            runCatching {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+            }.onFailure { error ->
+                // Требование API 34 (тип + разрешение) может не выполниться на чужой сборке:
+                // тогда поднимаем уведомление без явного типа — важнее не потерять команду.
+                AppLog.e(TAG, "startForeground(systemExempted) не удался — пробуем без типа", error)
+                runCatching { startForeground(NOTIFICATION_ID, notification) }
+                    .onFailure { AppLog.e(TAG, "startForeground не удался", it) }
+            }
         } else {
-            startForeground(NOTIFICATION_ID, notification)
+            runCatching { startForeground(NOTIFICATION_ID, notification) }
+                .onFailure { AppLog.e(TAG, "startForeground не удался", it) }
         }
     }
 
@@ -149,18 +231,78 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
      * Даём короткую паузу и только затем запускаем подключение.
      */
     private fun scheduleStart() {
-        if (isProxyActive()) return
+        mainHandler.removeCallbacks(pendingStart)
+        mainHandler.removeCallbacks(killProcessRunnable)
+        if (stopping.get()) {
+            // Старт во время teardown не теряем: finishStop/kill-процесс подхватит флаг,
+            // а молчаливый возврат здесь раньше оставлял UI в «Поднимаем туннель…» навсегда.
+            AppLog.i(TAG, "scheduleStart: идёт остановка — старт поставлен в очередь после teardown")
+            startRequestedWhileStopping = true
+            return
+        }
+        if (isProxyActive()) {
+            // Ядро уже живо (повторный старт/дубль команды): подтверждаем RUNNING,
+            // а не молчим — иначе состояние так и останется STARTING.
+            if (boxService != null) stateStore.update(ConnectionState.RUNNING, "Прокси включён")
+            return
+        }
         val waitMs = SETTLE_DELAY_MS - (SystemClock.elapsedRealtime() - lastStoppedAtMs)
         if (waitMs > 0) {
             AppLog.i(TAG, "Пауза ${waitMs}мс после остановки перед стартом")
-            mainHandler.postDelayed({ startConnection() }, waitMs)
+            mainHandler.postDelayed(pendingStart, waitMs)
         } else {
-            startConnection()
+            pendingStart.run()
         }
     }
 
+    private val pendingStart = Runnable { startConnection() }
+
+    /**
+     * Отменяет отложенный старт и watchdog'и. Отложенное убийство процесса НЕ отменяется:
+     * иначе служба осталась бы жить после остановки.
+     */
+    private fun cancelPendingWork() {
+        mainHandler.removeCallbacks(pendingStart)
+        mainHandler.removeCallbacks(startTimeout)
+    }
+
+    /**
+     * Смена профиля при активном подключении. Закрытие ядра идёт в фоне (QUIC-сессии прощаются
+     * секундами — на главном потоке это ANR и потерянный START), саму службу НЕ гасим и процесс
+     * НЕ убиваем: следом идёт старт с новым профилем.
+     */
+    private fun restartWithSelectedProfile() {
+        cancelPendingWork()
+        stateStore.update(ConnectionState.STARTING, "Смена профиля…")
+        Thread({
+            val startedAt = SystemClock.elapsedRealtime()
+            val closed = closeNativeServiceBlocking(STOP_TIMEOUT_MS)
+            AppLog.i(TAG, "смена профиля: ядро закрыто (успешно=$closed) за ${SystemClock.elapsedRealtime() - startedAt}мс")
+            mainHandler.post {
+                if (stopping.get()) {
+                    AppLog.i(TAG, "смена профиля отменена: пришла команда остановки")
+                    return@post
+                }
+                lastStoppedAtMs = SystemClock.elapsedRealtime()
+                scheduleStart()
+                armStartWatchdog()
+            }
+        }, "VibeTun-Restart").apply { isDaemon = true }.start()
+    }
+
     private fun startConnection() {
-        if (isProxyActive()) return
+        if (stopping.get()) {
+            // Остановка в полёте: поднимать ядро поверх неё нельзя — teardown перетрёт его.
+            // Но и терять старт нельзя: ставим в очередь, finishStop его подхватит.
+            AppLog.i(TAG, "startConnection: идёт остановка — старт поставлен в очередь")
+            startRequestedWhileStopping = true
+            return
+        }
+        if (isProxyActive()) {
+            // См. scheduleStart: не оставляем UI в STARTING при уже живом ядре.
+            if (boxService != null) stateStore.update(ConnectionState.RUNNING, "Прокси включён")
+            return
+        }
         if (!NativeCoreStatus.isIntegrated) {
             AppLog.e(TAG, "startConnection: ядро не собрано — ${NativeCoreStatus.message}")
             fail(NativeCoreStatus.message)
@@ -227,13 +369,16 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     }.getOrDefault("")
 
     private fun startSingBox(profile: ProxyProfile) {
-        AppLog.i(TAG, "startSingBox: сборка конфигурации…")
+        val routeSetName = activeRouteSet()
+        val rules = RouteSetStore(this).load(routeSetName)
+        AppLog.i(TAG, "startSingBox: сборка конфигурации… набор=«$routeSetName», правил=${rules.size}")
+        AppLog.i(TAG, "startSingBox: DNS — прямой=vibetun-dns-direct (address:local), reverse_mapping=true, strategy=ipv4_only. Проверка: в core.log (debug) строки «match[N] ip_cidr=… => vibetun-direct» / «domain_suffix=… => vibetun-direct» подтверждают работу DIRECT-правил; ошибки DNS — «failed to resolve»")
         val config = SingBoxConfigBuilder.build(
             profile = profile,
             selectedPackages = profileStore.selectedAppPackages,
             selectedAppsOnly = profileStore.selectedAppsOnly,
             directPackages = profileStore.directAppPackages,
-            routeRules = RouteSetStore(this).load(activeRouteSet()),
+            routeRules = rules,
         )
         val basePath = filesDir.absolutePath
         ensureLibboxReady(basePath)
@@ -263,9 +408,12 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     }
 
     private fun activeRouteSet(): String {
-        val store = RouteSetStore(this)
-        val sets = store.listSets()
-        return sets.firstOrNull() ?: ""
+        val saved = profileStore.activeRouteSetName
+        val sets = RouteSetStore(this).listSets()
+        // Если сохранённый набор существует на диске — используем его; иначе fallback на первый.
+        val name = if (saved.isNotBlank() && saved in sets) saved else sets.firstOrNull().orEmpty()
+        AppLog.i(TAG, "activeRouteSet: сохранён=«$saved», выбран=«$name», всего наборов=${sets.size}")
+        return name
     }
 
     private fun startAmneziaWg(profile: ProxyProfile) {
@@ -306,23 +454,27 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         // уходит в обычную сеть в обход VPN (утечка). Вместо этого весь IPv6 отправляем в TUN,
         // где WireGuard-пир (IPv4-only AllowedIPs) его отбрасывает.
         if (!hasIpv6DefaultRoute) builder.addRoute("::", 0)
+        // приложения с маршрутом DIRECT идут мимо туннеля AmneziaWG; DIRECT важнее PROXY,
+        // поэтому сначала вычитаем их из выбранных (на случай пересечения в хранилище).
+        val directPackages = profileStore.directAppPackages.sorted()
         if (profileStore.selectedAppsOnly) {
-            val selectedPackages = profileStore.selectedAppPackages.sorted()
+            val selectedPackages = (profileStore.selectedAppPackages - directPackages.toSet()).sorted()
             require(selectedPackages.isNotEmpty()) {
                 "Для режима «Выбранные приложения» отметьте хотя бы одно приложение."
             }
-            addApplications(builder, StringIteratorImpl(selectedPackages), allowed = true)
+            // Только allowed-список: addDisallowedApplication после addAllowedApplication
+            // запрещён Android (UnsupportedOperationException), а DIRECT-приложения
+            // и так не входят в allowed и потому идут мимо VPN.
+            addApplications(builder, selectedPackages, allowed = true)
         } else {
             // VibeTun не должен попадать в собственный VPN: транспортный UDP-сокет
             // AmneziaWG создаётся при первой отправке и в этот момент ещё не защищён
             // protect() — без исключения первый handshake уходит в собственный TUN
             // и до сервера не доходит (rx=0 при растущем tx).
             builder.addDisallowedApplication(packageName)
-        }
-        // приложения с маршрутом DIRECT идут мимо туннеля AmneziaWG
-        val directPackages = profileStore.directAppPackages.sorted()
-        if (directPackages.isNotEmpty()) {
-            addApplications(builder, StringIteratorImpl(directPackages), allowed = false)
+            if (directPackages.isNotEmpty()) {
+                addApplications(builder, directPackages, allowed = false)
+            }
         }
 
         val establishedTun = checkNotNull(builder.establish()) { "Android did not establish the AmneziaWG VPN interface." }
@@ -466,42 +618,182 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
 
     private fun fail(message: String) {
         AppLog.e(TAG, "fail: $message")
-        mainHandler.removeCallbacksAndMessages(null)
+        cancelPendingWork()
         stateStore.update(ConnectionState.ERROR, message)
+        // Ошибка запуска тоже не должна оставлять TUN: закрываем ядро в фоне и гасим процесс
+        // тем же путём, что и обычная остановка.
         profileStore.proxyWasActive = false
-        closeNativeService()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-        lastStoppedAtMs = SystemClock.elapsedRealtime()
+        stopping.set(true)
+        startRequestedWhileStopping = false
+        teardownInBackground("fail") { closed ->
+            AppLog.i(TAG, "fail: ядро закрыто (успешно=$closed), гасим службу")
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            scheduleProcessKill("fail")
+        }
     }
 
-    private fun stopConnection() {
-        AppLog.i(TAG, "stopConnection")
-        mainHandler.removeCallbacksAndMessages(null)
-        closeNativeService()
+    /**
+     * Остановка подключения. Единственный владелец жизненного цикла — служба: UI и плитка только
+     * просят остановку (ACTION_STOP) и ждут STOPPED. Закрытие ядра выполняется в фоновом потоке,
+     * поэтому главный поток службы не блокируется зависшим `boxService.close()`.
+     */
+    private fun stopConnection(reason: String) {
+        val requestedAtMs = SystemClock.elapsedRealtime()
+        AppLog.i(TAG, "stop($reason): запрос остановки, ядро активно=${isProxyActive()}")
+        cancelPendingWork()
+        if (!stopping.compareAndSet(false, true)) {
+            AppLog.i(TAG, "stop($reason): остановка уже выполняется — повторный запрос игнорируем")
+            return
+        }
+        startRequestedWhileStopping = false
+        // Синхронная запись (файл + commit): процесс будет убит сразу после закрытия ядра,
+        // и apply() может не успеть — тогда после рестарта VPN поднялся бы заново.
         profileStore.proxyWasActive = false
-        stateStore.update(ConnectionState.STOPPED)
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-        lastStoppedAtMs = SystemClock.elapsedRealtime()
+        stateStore.update(ConnectionState.STOPPING, "Отключаемся…")
+        teardownInBackground("stop") { closed -> finishStop(closed, requestedAtMs) }
     }
 
-    private fun closeNativeService() {
-        val currentBoxService = boxService
-        boxService = null
-        runCatching { currentBoxService?.close() }
-            .onFailure { Log.w(TAG, "Error while stopping sing-box", it) }
+    /**
+     * Закрывает ядро и TUN в фоновом потоке (boxService.close() может занимать секунды:
+     * QUIC-ядра прощаются с сервером), результат отдаёт на главный поток.
+     */
+    private fun teardownInBackground(stage: String, finish: (closed: Boolean) -> Unit) {
+        Thread({
+            val startedAt = SystemClock.elapsedRealtime()
+            val closed = closeNativeServiceBlocking(STOP_TIMEOUT_MS)
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            AppLog.i(TAG, "$stage: закрытие ядра завершено (успешно=$closed) за ${elapsed}мс")
+            mainHandler.post { finish(closed) }
+        }, STOP_THREAD_NAME).apply { isDaemon = true }.start()
+    }
 
-        val currentAmneziaHandle = amneziaHandle
-        amneziaHandle = NO_AMNEZIA_HANDLE
-        if (currentAmneziaHandle != NO_AMNEZIA_HANDLE) {
-            runCatching { AmneziaGoBackend.awgTurnOff(currentAmneziaHandle) }
-                .onFailure { Log.w(TAG, "Error while stopping AmneziaWG", it) }
+    private fun finishStop(closed: Boolean, requestedAtMs: Long) {
+        if (startRequestedWhileStopping) {
+            // Пока закрывали ядро, пришёл ACTION_START (смена профиля/повторное подключение).
+            // Процесс не гасим: новый start потерялся бы вместе с ним.
+            AppLog.i(TAG, "stop: во время остановки запрошен старт — процесс оставляем, подключаемся заново")
+            stopping.set(false)
+            startRequestedWhileStopping = false
+            lastStoppedAtMs = SystemClock.elapsedRealtime()
+            scheduleStart()
+            armStartWatchdog()
+            return
         }
 
-        runCatching { tunDescriptor?.close() }
-            .onFailure { Log.w(TAG, "Error while closing VPN descriptor", it) }
-        tunDescriptor = null
+        // TUN закрыт (включая дубликат fd, который держал libbox) — VPN-ключ в шторке должен исчезнуть.
+        AppLog.i(
+            TAG,
+            "stop: TUN закрыт (ядро закрыто успешно=$closed) за ${SystemClock.elapsedRealtime() - requestedAtMs}мс с запроса",
+        )
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            .onFailure { AppLog.e(TAG, "stop: stopForeground не удался", it) }
+        AppLog.i(TAG, "stop: stopForeground(STOP_FOREGROUND_REMOVE) выполнен")
+        if (stateStore.state == ConnectionState.STOPPING) {
+            stateStore.update(ConnectionState.STOPPED)
+            AppLog.i(TAG, "stop: состояние STOPPED записано службой")
+        } else {
+            AppLog.i(TAG, "stop: состояние уже ${stateStore.state} — STOPPED не пишем")
+        }
+        // Сбрасываем флаг остановки ДО отложенного убийства процесса: раньше stopping
+        // оставался true до самой смерти процесса, и ACTION_START в этом окне уходил
+        // в ветку «ждём teardown», хотя teardown уже завершён.
+        stopping.set(false)
+        scheduleProcessKill("stop")
+    }
+
+    /**
+     * Планирует завершение процесса. Процесс `:vpn` / `:vpn_awg` выделен под одно ядро: его смерть
+     * гарантированно закрывает все fd TUN (включая дубликат libbox, который не закрылся, если
+     * `boxService.close()` завис) и сбрасывает Go-runtime перед следующим подключением.
+     * Небольшая задержка нужна, чтобы новый ACTION_START успел отменить убийство.
+     */
+    private fun scheduleProcessKill(stage: String) {
+        mainHandler.removeCallbacks(killProcessRunnable)
+        mainHandler.postDelayed(killProcessRunnable, PROCESS_KILL_DELAY_MS)
+        AppLog.i(TAG, "$stage: процесс будет убит через ${PROCESS_KILL_DELAY_MS}мс, если не придёт новый старт")
+    }
+
+    private val killProcessRunnable = Runnable {
+        val current = instance
+        if (current != null && current !== this@VibeTunVpnService) {
+            // Службу уже пересоздали под новое подключение — убивать процесс нельзя.
+            AppLog.i(TAG, "kill: служба пересоздана — убийство процесса отменено")
+            return@Runnable
+        }
+        if (startRequestedWhileStopping) {
+            AppLog.i(TAG, "kill: за время ожидания пришёл ACTION_START — процесс не убиваем")
+            stopping.set(false)
+            startRequestedWhileStopping = false
+            lastStoppedAtMs = SystemClock.elapsedRealtime()
+            scheduleStart()
+            armStartWatchdog()
+            return@Runnable
+        }
+        AppLog.i(TAG, "kill: stopSelf + Process.killProcess(pid=${Process.myPid()}) — ядро ОС закроет оставшиеся fd TUN")
+        runCatching { stopSelf() }
+        Process.killProcess(Process.myPid())
+    }
+
+    /**
+     * Синхронно закрывает ядро и TUN. Вызывать только из фонового потока.
+     * false — закрытие не уложилось в таймаут: вызывающий обязан убить процесс,
+     * иначе TUN (и VPN-ключ в шторке) может остаться.
+     */
+    private fun closeNativeServiceBlocking(timeoutMs: Long): Boolean {
+        val result = AtomicBoolean(false)
+        val closer = Thread({ result.set(closeNativeService()) }, CLOSE_THREAD_NAME).apply { isDaemon = true }
+        closer.start()
+        closer.join(timeoutMs)
+        if (closer.isAlive) {
+            AppLog.e(TAG, "close: закрытие ядра не уложилось в ${timeoutMs}мс — закроем его смертью процесса")
+            return false
+        }
+        return result.get()
+    }
+
+    /** Идемпотентное закрытие нативного ядра и TUN. Возвращает false, если что-то закрылось с ошибкой. */
+    private fun closeNativeService(): Boolean {
+        var success = true
+        synchronized(closeLock) {
+            val currentBoxService = boxService
+            boxService = null
+            if (currentBoxService != null) {
+                val startedAt = SystemClock.elapsedRealtime()
+                runCatching { currentBoxService.close() }
+                    .onSuccess { AppLog.i(TAG, "close: boxService.close() завершён за ${SystemClock.elapsedRealtime() - startedAt}мс") }
+                    .onFailure {
+                        success = false
+                        AppLog.e(TAG, "close: ошибка boxService.close()", it)
+                        Log.w(TAG, "Error while stopping sing-box", it)
+                    }
+            }
+
+            val currentAmneziaHandle = amneziaHandle
+            amneziaHandle = NO_AMNEZIA_HANDLE
+            if (currentAmneziaHandle != NO_AMNEZIA_HANDLE) {
+                val startedAt = SystemClock.elapsedRealtime()
+                runCatching { AmneziaGoBackend.awgTurnOff(currentAmneziaHandle) }
+                    .onSuccess { AppLog.i(TAG, "close: awgTurnOff() завершён за ${SystemClock.elapsedRealtime() - startedAt}мс") }
+                    .onFailure {
+                        success = false
+                        AppLog.e(TAG, "close: ошибка awgTurnOff()", it)
+                        Log.w(TAG, "Error while stopping AmneziaWG", it)
+                    }
+            }
+
+            val descriptor = tunDescriptor
+            tunDescriptor = null
+            if (descriptor != null) {
+                runCatching { descriptor.close() }
+                    .onSuccess { AppLog.i(TAG, "close: tunDescriptor закрыт") }
+                    .onFailure {
+                        success = false
+                        AppLog.e(TAG, "close: ошибка закрытия tunDescriptor", it)
+                        Log.w(TAG, "Error while closing VPN descriptor", it)
+                    }
+            }
+        }
+        return success
     }
 
     override fun autoDetectInterfaceControl(fd: Int) {
@@ -543,8 +835,17 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
                 addRouteRanges(builder, options.inet4RouteRange, "0.0.0.0", hasInet4)
                 addRouteRanges(builder, options.inet6RouteRange, "::", hasInet6)
             }
-            addApplications(builder, options.includePackage, allowed = true)
-            addApplications(builder, options.excludePackage, allowed = false)
+            // Android запрещает смешивать addAllowedApplication и addDisallowedApplication
+            // в одном Builder (UnsupportedOperationException): если задан список включённых
+            // приложений, DIRECT-приложения и так не попадут в VPN — они просто не входят
+            // в allowed-список, отдельный exclude для них не нужен и вреден.
+            val includePackages = drainPackages(options.includePackage)
+            val excludePackages = drainPackages(options.excludePackage)
+            if (includePackages.isNotEmpty()) {
+                addApplications(builder, includePackages, allowed = true)
+            } else {
+                addApplications(builder, excludePackages, allowed = false)
+            }
         }
 
         val newTun = checkNotNull(builder.establish()) { "Android did not establish the VPN interface." }
@@ -584,9 +885,13 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         }
     }
 
-    private fun addApplications(builder: Builder, packages: StringIterator, allowed: Boolean) {
+    private fun drainPackages(packages: StringIterator): List<String> {
         val packageNames = mutableListOf<String>()
         while (packages.hasNext()) packageNames += packages.next()
+        return packageNames
+    }
+
+    private fun addApplications(builder: Builder, packageNames: List<String>, allowed: Boolean) {
         if (packageNames.isEmpty()) return
         if (allowed && packageNames.any { it == packageName }) {
             throw IllegalArgumentException("VibeTun не может быть включён в собственный VPN-маршрут.")
@@ -737,21 +1042,33 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     }
 
     override fun onRevoke() {
-        stopConnection()
+        // Система отзывает VPN (пользователь отключил его в настройках, подключился другой VPN).
+        // Идём тем же асинхронным путём: закрываем ядро в фоне, пишем STOPPED, гасим процесс.
+        AppLog.i(TAG, "onRevoke: система отзывает VPN")
+        stopConnection("onRevoke")
         super.onRevoke()
     }
 
     override fun onDestroy() {
-        AppLog.i(TAG, "onDestroy")
+        AppLog.i(TAG, "onDestroy: начало (ядро активно=${isProxyActive()}, остановка=${stopping.get()})")
         if (instance === this) instance = null
-        mainHandler.removeCallbacksAndMessages(null)
+        cancelPendingWork()
         lastStoppedAtMs = SystemClock.elapsedRealtime()
         interfaceCallbacks.values.toList().forEach { callback ->
             runCatching { connectivity.unregisterNetworkCallback(callback) }
         }
         interfaceCallbacks.clear()
-        closeNativeService()
+        // onDestroy не должен блокировать главный поток: до 1 с на закрытие, остальное сделает
+        // убийство процесса, которое уже запланировано остановкой.
+        val hadCore = isProxyActive()
+        val closed = closeNativeServiceBlocking(ON_DESTROY_TIMEOUT_MS)
+        AppLog.i(TAG, "onDestroy: ядро закрыто успешно=$closed")
+        if (hadCore && stateStore.state != ConnectionState.STOPPED && stateStore.state != ConnectionState.ERROR) {
+            // Службу уничтожила система, а TUN всё равно закрыт — UI не должен остаться «Подключено».
+            stateStore.update(ConnectionState.STOPPED, "VPN остановлен системой")
+        }
         endpointResolver.shutdownNow()
+        AppLog.i(TAG, "onDestroy: завершён")
         super.onDestroy()
     }
 
@@ -769,7 +1086,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         )
     }
 
-    private fun buildNotification(profileId: String? = requestedProfileId): Notification {
+    private fun buildNotification(profileId: String? = requestedProfileId, contentText: String? = null): Notification {
         val openApp = PendingIntent.getActivity(
             this,
             0,
@@ -783,7 +1100,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_tile_vibetun)
             .setContentTitle(getString(R.string.notification_title))
-            .setContentText(selected)
+            .setContentText(contentText ?: selected)
             .setContentIntent(openApp)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -807,12 +1124,31 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         const val ACTION_START = "com.vibetun.app.action.START"
         const val ACTION_STOP = "com.vibetun.app.action.STOP"
         const val ACTION_TOGGLE = "com.vibetun.app.action.TOGGLE"
+
+        /**
+         * Аварийная остановка: служба сразу убивает свой процесс, не дожидаясь закрытия ядра.
+         * Отправляется watchdog'ом [StopWatchdog], если STOPPED не пришёл за [STOP_TIMEOUT_MS].
+         */
+        const val ACTION_FORCE_KILL = "com.vibetun.app.action.FORCE_KILL"
         const val EXTRA_PROFILE_ID = "com.vibetun.app.extra.PROFILE_ID"
         private const val CHANNEL_ID = "vibetun_proxy"
         private const val NOTIFICATION_ID = 4201
         private const val NO_AMNEZIA_HANDLE = -1
         private const val SETTLE_DELAY_MS = 2500L
         private const val AWG_HANDSHAKE_TIMEOUT_MS = 30_000L
+
+        /** Сколько ждём закрытия ядра, прежде чем закрыть его смертью процесса. */
+        private const val STOP_TIMEOUT_MS = 4_000L
+
+        /** onDestroy не должен блокировать главный поток дольше этого времени. */
+        private const val ON_DESTROY_TIMEOUT_MS = 1_000L
+
+        /** Отсрочка kill процесса: за это время новый ACTION_START успевает отменить убийство. */
+        private const val PROCESS_KILL_DELAY_MS = 500L
+
+        private const val STOP_NOTIFICATION_TEXT = "Отключаемся…"
+        private const val STOP_THREAD_NAME = "VibeTun-Stop"
+        private const val CLOSE_THREAD_NAME = "VibeTun-Close"
         internal const val FAMILY_AWG = "awg"
         internal const val FAMILY_LIBBOX = "libbox"
 

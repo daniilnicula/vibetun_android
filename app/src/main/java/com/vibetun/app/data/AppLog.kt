@@ -49,6 +49,15 @@ object AppLog {
         return logFile ?: File(File(context.filesDir, "logs"), "vibetun-main.log")
     }
 
+    /**
+     * Суффикс текущего процесса: "main" (UI, плитка), "vpn" (`:vpn`), "awg" (`:vpn_awg`).
+     * Используется в именах лог-файлов и как владелец состояния соединения.
+     */
+    fun processSuffix(context: Context): String {
+        init(context)
+        return processName
+    }
+
     /** Все существующие лог-файлы (всех процессов, включая ротированные) для отправки. */
     fun shareableFiles(context: Context): List<File> {
         val dir = File(context.filesDir, "logs")

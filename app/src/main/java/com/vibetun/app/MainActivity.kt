@@ -18,10 +18,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.vibetun.app.data.ConnectionAction
+import com.vibetun.app.data.ConnectionState
 import com.vibetun.app.data.VibeTunViewModel
+import com.vibetun.app.data.actionOnTap
 import com.vibetun.app.service.ConnectionStateStore
 import com.vibetun.app.service.VpnServiceLauncher
 import com.vibetun.app.service.NativeCoreStatus
+import com.vibetun.app.service.StopWatchdog
 import com.vibetun.app.ui.VibeTunRoot
 import com.vibetun.app.ui.VibeTunTheme
 
@@ -34,7 +38,7 @@ class MainActivity : ComponentActivity() {
             // надёжнее брать состояние прямо из extras broadcast, а не из prefs.
             val stateName = intent.getStringExtra(ConnectionStateStore.EXTRA_STATE)
             if (stateName != null) {
-                val state = runCatching { com.vibetun.app.data.ConnectionState.valueOf(stateName) }
+                val state = runCatching { ConnectionState.valueOf(stateName) }
                     .getOrNull() ?: return
                 viewModel.onConnectionStateFromService(
                     state,
@@ -49,7 +53,9 @@ class MainActivity : ComponentActivity() {
     private val vpnConsent = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK) startVpnConnection()
         else viewModel.setConnectionState(
-            com.vibetun.app.data.ConnectionState.STOPPED,
+            // Единственный случай, когда STOPPED пишет UI: подключение даже не начиналось
+            // (разрешение VPN не выдано), служба не запускалась — обмануть нечем.
+            ConnectionState.STOPPED,
             "Разрешение VPN не выдано.",
         )
     }
@@ -64,7 +70,7 @@ class MainActivity : ComponentActivity() {
         runCatching {
             contentResolver.openOutputStream(uri)?.writer()?.use { it.write(json) }
         }.onSuccess {
-            viewModel.feedback = "Набор правил экспортирован."
+            viewModel.feedback = "Маршруты экспортированы."
         }.onFailure {
             viewModel.feedback = "Не удалось записать файл: ${it.message}"
         }
@@ -93,9 +99,11 @@ class MainActivity : ComponentActivity() {
         window.statusBarColor = android.graphics.Color.rgb(25, 27, 29)
         window.navigationBarColor = android.graphics.Color.rgb(25, 27, 29)
         handleTileIntent(intent)
+        // Сторож закрытия: при смахивании приложения из недавних VPN выключится.
+        runCatching { startService(Intent(this, com.vibetun.app.service.AppTaskWatcherService::class.java)) }
 
         setContent {
-            VibeTunTheme(darkTheme = viewModel.darkTheme) {
+            VibeTunTheme(darkTheme = viewModel.darkTheme, accentColorArgb = viewModel.accentColorArgb) {
                 SideEffect {
                     val barColor = if (viewModel.darkTheme) android.graphics.Color.rgb(25, 27, 29) else android.graphics.Color.rgb(244, 245, 247)
                     window.statusBarColor = barColor
@@ -119,8 +127,7 @@ class MainActivity : ComponentActivity() {
                 )
                 LaunchedEffect(intent?.getBooleanExtra(EXTRA_CONNECT_FROM_TILE, false)) {
                     if (intent?.getBooleanExtra(EXTRA_CONNECT_FROM_TILE, false) == true) {
-                        viewModel.currentTab = com.vibetun.app.data.AppTab.Profiles
-                        toggleProxy()
+                        connectFromTile()
                         intent.removeExtra(EXTRA_CONNECT_FROM_TILE)
                     }
                 }
@@ -133,7 +140,7 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         handleTileIntent(intent)
         if (intent.getBooleanExtra(EXTRA_CONNECT_FROM_TILE, false)) {
-            toggleProxy()
+            connectFromTile()
             intent.removeExtra(EXTRA_CONNECT_FROM_TILE)
         }
     }
@@ -161,6 +168,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         startWatchdog.removeCallbacksAndMessages(null)
+        // Полное закрытие приложения (finish, не пересоздание) — VPN не запоминаем и гасим.
+        // Смахивание из недавних ловит AppTaskWatcherService: там onDestroy может не вызваться.
+        if (isFinishing && viewModel.isConnected) {
+            VpnServiceLauncher.stop(this)
+        }
         super.onDestroy()
     }
 
@@ -179,12 +191,29 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun toggleProxy() {
-        if (viewModel.connectionState == com.vibetun.app.data.ConnectionState.RUNNING) {
-            startWatchdog.removeCallbacksAndMessages(null)
-            VpnServiceLauncher.stop(this)
-            viewModel.setConnectionState(com.vibetun.app.data.ConnectionState.STOPPED)
-            return
+        when (viewModel.connectionState.actionOnTap()) {
+            ConnectionAction.STOP -> requestStop()
+            // Кнопка неактивна и во время запуска, и во время остановки: дублирующий тап игнорируем.
+            ConnectionAction.IGNORE ->
+                if (viewModel.connectionState == ConnectionState.STOPPING) viewModel.feedback = "Отключение уже выполняется…"
+            ConnectionAction.CONNECT -> startProxyFromUi()
         }
+    }
+
+    /**
+     * Остановка по тапу «Отключить». Служба живёт в своём процессе и сама закрывает ядро и TUN,
+     * поэтому STOPPED ждём от неё (broadcast + файл состояния), а не пишем его сразу: иначе UI
+     * показывал бы «Отключено», пока VPN-ключ в шторке и туннель ещё живы.
+     */
+    private fun requestStop() {
+        startWatchdog.removeCallbacksAndMessages(null)
+        viewModel.setConnectionState(ConnectionState.STOPPING, "Отключаемся…")
+        VpnServiceLauncher.stop(this)
+        StopWatchdog.arm(this)
+    }
+
+    /** Подключение из приложения; разрешение VPN спрашивается здесь же. */
+    private fun startProxyFromUi() {
         if (viewModel.selectedProfile == null) {
             viewModel.feedback = "Сначала добавьте или выберите профиль."
             return
@@ -198,13 +227,26 @@ class MainActivity : ComponentActivity() {
         if (permission != null) vpnConsent.launch(permission) else startVpnConnection()
     }
 
+    /**
+     * Запрос подключения из плитки быстрых настроек: в отличие от [toggleProxy] он никогда
+     * не выключает уже работающий VPN (плитка шлёт его только когда хочет подключиться).
+     */
+    private fun connectFromTile() {
+        viewModel.currentTab = com.vibetun.app.data.AppTab.Profiles
+        when (viewModel.connectionState.actionOnTap()) {
+            // Плитка шлёт этот запрос, только когда хочет подключиться: уже работающий VPN не гасим.
+            ConnectionAction.STOP, ConnectionAction.IGNORE -> Unit
+            ConnectionAction.CONNECT -> startProxyFromUi()
+        }
+    }
+
     private fun startVpnConnection() {
         if (!NativeCoreStatus.isIntegrated) {
             viewModel.showCoreUnavailable()
             return
         }
         val profile = viewModel.selectedProfile ?: return
-        viewModel.setConnectionState(com.vibetun.app.data.ConnectionState.STARTING, "Запуск…")
+        viewModel.setConnectionState(ConnectionState.STARTING, "Запуск…")
         // Службу выбирает лаунчер по протоколу: AmneziaWG и sing-box живут в разных процессах.
         VpnServiceLauncher.start(this, profile)
         armStartWatchdog()
@@ -220,12 +262,15 @@ class MainActivity : ComponentActivity() {
         startWatchdog.removeCallbacksAndMessages(null)
         startWatchdog.postDelayed({
             viewModel.refreshConnectionState() // свежее состояние из файла
-            if (viewModel.connectionState == com.vibetun.app.data.ConnectionState.STARTING) {
-                VpnServiceLauncher.stop(this)
+            if (viewModel.connectionState == ConnectionState.STARTING) {
+                // Сначала фиксируем причину, потом гасим зависшую службу: остановка переведёт
+                // состояние в STOPPING/STOPPED и сообщение об ошибке останется только в логах.
                 viewModel.setConnectionState(
-                    com.vibetun.app.data.ConnectionState.ERROR,
+                    ConnectionState.ERROR,
                     "VPN-служба не ответила за ${START_TIMEOUT_MS / 1000} с. Пришлите логи (Настройки → Логи).",
                 )
+                VpnServiceLauncher.stop(this)
+                StopWatchdog.arm(this)
             }
         }, START_TIMEOUT_MS)
     }

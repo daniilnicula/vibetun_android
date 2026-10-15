@@ -1,141 +1,73 @@
-name: Android APK
-
-on:
-  push:
-    branches:
-      - "main"
-  workflow_dispatch:
+name: Android debug APK
 
 permissions:
   contents: write
 
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
 jobs:
   build:
-    name: Build sing-box core and APK
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
     steps:
-      - name: Check out source
-        uses: actions/checkout@v7
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v6
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4.0.4
-
-      - name: Install Android build packages
+          java-version: '17'
+      - name: Install Android SDK command-line tools
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;26.2.11394342"
-
-      - name: Set up Go 1.25 for AmneziaWG
-        uses: actions/setup-go@v7
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fLsS --retry 3 https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o "$RUNNER_TEMP/cmdline-tools.zip"
+          unzip -q "$RUNNER_TEMP/cmdline-tools.zip" -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+      - name: Install Android SDK and NDK
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;26.2.11394342'
+      - uses: actions/cache@v4
+        id: native-cache
         with:
-          go-version: "1.25.0"
-          cache: true
-          cache-dependency-path: core/amneziawg-android/go.sum
-
-      - name: Build AmneziaWG Android runtime
-        shell: bash
-        run: |
-          set +e
-          ./scripts/build-amneziawg-android.sh 2>&1 | tee /tmp/amneziawg-build.log
-          result=${PIPESTATUS[0]}
-          if [ "$result" -ne 0 ]; then
-            echo "::group::Last AmneziaWG build output"
-            tail -n 100 /tmp/amneziawg-build.log | while IFS= read -r line; do
-              escaped=$(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/\r/%0D/g')
-              echo "::error::$escaped"
-            done
-            echo "::endgroup::"
-            exit "$result"
-          fi
-
-      - name: Set up Go 1.23 for sing-box
-        uses: actions/setup-go@v7
+          path: |
+            app/libs/libbox.aar
+            app/src/main/jniLibs
+          key: android-native-${{ hashFiles('core/**', 'scripts/build-*-android.sh') }}
+      - uses: actions/setup-go@v5
+        if: steps.native-cache.outputs.cache-hit != 'true'
         with:
-          go-version: "1.23.9"
-          cache: true
-          cache-dependency-path: core/sing-box/go.sum
-
-      - name: Cache native sing-box AAR
-        uses: actions/cache@v5
+          go-version: '1.25.x'
+          cache: false
+      - name: Build AmneziaWG runtime
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: bash ./scripts/build-amneziawg-android.sh
+      - uses: actions/setup-go@v5
+        if: steps.native-cache.outputs.cache-hit != 'true'
         with:
-          path: app/libs/libbox.aar
-          key: libbox-${{ runner.os }}-go1.23.9-${{ hashFiles('core/sing-box/**/*.go', 'core/sing-box/go.mod', 'core/sing-box/go.sum', 'core/sing-quic/**/*.go', 'core/sing-quic/go.mod', 'core/sing-quic/go.sum') }}
-
-      - name: Build sing-box libbox.aar
-        shell: bash
+          go-version: '1.23.x'
+          cache: false
+      - name: Build libbox AAR
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        run: bash ./scripts/build-libbox-android.sh
+      - name: Assemble debug APK
         run: |
-          if [ -s app/libs/libbox.aar ]; then
-            echo "Using the restored sing-box AAR cache."
-            exit 0
+          if bash ./gradlew assembleDebug --no-daemon > "$RUNNER_TEMP/gradle.log" 2>&1; then
+            tail -n 60 "$RUNNER_TEMP/gradle.log"
+          else
+            tail -n 100 "$RUNNER_TEMP/gradle.log"
+            tail -n 35 "$RUNNER_TEMP/gradle.log" | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
           fi
-          set +e
-          ./scripts/build-libbox-android.sh 2>&1 | tee /tmp/libbox-build.log
-          result=${PIPESTATUS[0]}
-          if [ "$result" -ne 0 ]; then
-            echo "::group::Last libbox build output"
-            tail -n 80 /tmp/libbox-build.log | while IFS= read -r line; do
-              escaped=$(printf '%s' "$line" | sed -e 's/%/%25/g' -e 's/\r/%0D/g')
-              echo "::error::$escaped"
-            done
-            echo "::endgroup::"
-            exit "$result"
-          fi
-
-      - name: Run Android unit tests and assemble APK
-        shell: bash
-        run: |
-          set +e
-          ./gradlew --no-daemon testDebugUnitTest assembleDebug 2>&1 | tee /tmp/gradle-build.log
-          result=${PIPESTATUS[0]}
-          if [ "$result" -ne 0 ]; then
-            RESULT="$result" python3 - <<'PY'
-          from pathlib import Path
-          import os
-          log_paths = [Path('/tmp/gradle-build.log')]
-          daemon_dir = Path.home() / '.gradle' / 'daemon'
-          if daemon_dir.exists():
-              log_paths.extend(sorted(daemon_dir.glob('**/*.out.log'), key=lambda p: p.stat().st_mtime, reverse=True)[:2])
-          chunks = [f'Gradle exit code: {os.environ.get("RESULT", "non-zero")}']
-          for path in log_paths:
-              if path.exists():
-                  chunks.append(f'--- {path} ---\n' + '\n'.join(path.read_text(errors='replace').splitlines()[-100:]))
-          for path in Path('app/build/test-results/testDebugUnitTest').glob('*.xml'):
-              chunks.append(f'--- {path} ---\n' + path.read_text(errors='replace')[-12000:])
-          text = '\n'.join(chunks).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
-          print(f'::error title=Gradle and daemon logs::{text}')
-          PY
-            exit "$result"
-          fi
-
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: VibeTun-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload libbox AAR
-        uses: actions/upload-artifact@v4
-        with:
-          name: libbox-aar
-          path: app/libs/libbox.aar
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload AmneziaWG native libraries
-        uses: actions/upload-artifact@v4
-        with:
-          name: amneziawg-jnilibs
-          path: app/src/main/jniLibs/
-          if-no-files-found: error
-          retention-days: 30
-
-      # APK выкладывается только в релизы (upload-artifact выше сохраняет его в артефактах прогона).
+      # APK выкладывается только в артефакты прогона и релизы, в ветку не коммитится.

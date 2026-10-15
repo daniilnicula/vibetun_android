@@ -136,18 +136,22 @@ object SingBoxConfigBuilder {
             "route",
             JSONObject()
                 .put("auto_detect_interface", true)
-                .put("rules", createRouteRules(routeRules))
+                .put("rules", createRouteRules(routeRules, directPackages, if (selectedAppsOnly) packages else emptyList()))
                 .put("final", PROXY_TAG),
         )
         config.put(
             "dns",
             JSONObject()
                 .put("servers", createDnsServers())
-                .put("rules", createDnsRules(routeRules, listOfNotNull(proxy.optString("server"))))
+                .put("rules", createDnsRules(routeRules, listOfNotNull(proxy.optString("server")), directPackages))
                 .put("final", DNS_TAG)
                 // IPv4-only: серверы в основном IPv4, AAAA-ответы заворачивают приложения
                 // на IPv6-адреса, которые через туннель не достижимы (YouTube вис).
-                .put("strategy", "ipv4_only"),
+                .put("strategy", "ipv4_only")
+                // Обратное отображение IP→домен: если снифф не дал домен (ECH, кэш браузера),
+                // ядро восстанавливает его из собственного DNS-ответа, и доменные правила
+                // маршрутизации всё равно срабатывают.
+                .put("reverse_mapping", true),
         )
         return config
     }
@@ -185,13 +189,19 @@ object SingBoxConfigBuilder {
             tun.put("strict_route", true)
             if (!tun.has("inet4_address")) tun.put("inet4_address", JSONArray().put("172.19.0.1/30"))
             // IPv4-only: inet6_address не добавляем — AAAA-трафик через IPv4-only серверы виснет
-            if (selectedAppsOnly) tun.put("include_package", JSONArray(packages))
-            if (directPackages.isNotEmpty()) tun.put("exclude_package", JSONArray(directPackages))
+            // Перезаписываем всегда: иначе в пользовательском JSON останутся чужие
+            // include/exclude_package, и per-app маршрутизация из настроек не сработает.
+            if (selectedAppsOnly) tun.put("include_package", JSONArray(packages)) else tun.remove("include_package")
+            if (directPackages.isNotEmpty()) tun.put("exclude_package", JSONArray(directPackages)) else tun.remove("exclude_package")
         }
         // Android's system stack may try to bind sockets to the virtual IPv6 address and fail
         // with EADDRNOTAVAIL. gVisor keeps the TCP/IP stack inside the process and avoids that.
         tun.put("stack", "gvisor")
         tun.put("sniff", true)
+        // sniff_override_destination намеренно НЕ ставим: см. комментарий в createTunInbound.
+        // Доменные правила работают через metadata.Domain (заполняется сниффом),
+        // ip_cidr — через исходный Destination.Addr.
+        tun.remove("sniff_override_destination")
         config.put("inbounds", inbounds)
         if (!config.has("log")) {
             config.put("log", JSONObject().put("level", "info").put("output", "logs/core.log").put("timestamp", true))
@@ -211,7 +221,10 @@ object SingBoxConfigBuilder {
             route.put("final", proxyTag)
         }
         route.put("auto_detect_interface", true)
-        val userRules = createRouteRules(routeRules)
+        // PROXY-правила ссылаются на реальный серверный outbound (route.final), а не на
+        // константу PROXY_TAG — в пользовательском JSON теги свои, «vibetun-proxy» нет.
+        val actualProxyTag = route.optString("final")
+        val userRules = createRouteRules(routeRules, directPackages, if (selectedAppsOnly) packages else emptyList(), proxyOutbound = actualProxyTag)
         val existingRules = route.optJSONArray("rules") ?: JSONArray()
         val mergedRules = JSONArray()
         for (index in 0 until userRules.length()) mergedRules.put(userRules.getJSONObject(index))
@@ -243,6 +256,7 @@ object SingBoxConfigBuilder {
             .put("servers", createDnsServers())
             .put("final", DNS_TAG)
             .put("strategy", "ipv4_only")
+        if (!dns.has("reverse_mapping")) dns.put("reverse_mapping", true)
         val servers = dns.optJSONArray("servers") ?: JSONArray().also { dns.put("servers", it) }
         val hasDirectServer = (0 until servers.length()).any { servers.optJSONObject(it)?.optString("tag") == DNS_DIRECT_TAG }
         if (!hasDirectServer) servers.put(directDnsServer())
@@ -255,32 +269,67 @@ object SingBoxConfigBuilder {
     }
 
     /** Правила маршрутизации: QUIC блокируем первым правилом, DIRECT-значения
-     *  уходят в vibetun-direct, остальное решает final. */
-    private fun createRouteRules(rules: List<RouteRule>): JSONArray {
+     *  уходят в vibetun-direct, PROXY-значения — явно в прокси-outbound, остальное решает final.
+     *
+     *  Раньше правила PROXY молчо выбрасывались: для обычного конфига это маскировалось
+     *  тем, что final и так прокси, но в полном пользовательском JSON (final может быть
+     *  любым) и при перекрытии широким DIRECT-правилом явный PROXY не работал вовсе.
+     *  Группы идут от частных к общим (ip_cidr → domain_suffix → keyword) внутри каждого
+     *  действия. Доменные/IP-правила стоят РАНЬШЕ per-app: если приложение идёт через
+     *  прокси (само или по умолчанию), домены/IP из «Домены и IP» решат по каждому
+     *  соединению (Chrome=PROXY, но домен DIRECT → этот домен напрямую). Per-app правила
+     *  ниже — запасной маршрут для трафика приложений, не попавшего под доменные правила;
+     *  приложение с маршрутом DIRECT обычно вообще не попадает в TUN (exclude на уровне
+     *  Android), поэтому доменное PROXY его оттуда не вытащит.
+     *
+     *  proxyOutbound: тег серверного outbound для PROXY-правил. Для стандартного конфига
+     *  это PROXY_TAG («vibetun-proxy»), для полного пользовательского JSON — тег реального
+     *  серверного outbound (тот же, что в route.final), чтобы правила не ссылались на
+     *  несуществующий тег. */
+    private fun createRouteRules(rules: List<RouteRule>, directPackages: List<String> = emptyList(), proxyPackages: List<String> = emptyList(), proxyOutbound: String = PROXY_TAG): JSONArray {
         // DNS перехватываем первым правилом: иначе запросы уходят к final как обычный UDP
         // на 172.19.0.2:53 и не получают ответа (sing-box 1.9 не перехватывает DNS сам).
         val merged = JSONArray()
             .put(JSONObject().put("protocol", "dns").put("outbound", DNS_OUT_TAG))
             .put(JSONObject().put("port", 53).put("outbound", DNS_OUT_TAG))
             .put(quicBlockRule())
-        val direct = rules.filter { it.action == RouteAction.DIRECT }
-        fun valuesOf(type: RouteRuleType): JSONArray = JSONArray().apply {
-            direct.filter { it.type == type }.forEach { rule ->
-                put(
-                    if (type == RouteRuleType.KEYWORD) RouteRule.keywordRegex(rule.value)
-                    else rule.value.trim().removePrefix("*."),
-                )
+        fun group(action: RouteAction, outbound: String) {
+            fun valuesOf(type: RouteRuleType): JSONArray = JSONArray().apply {
+                rules.filter { it.action == action && it.type == type }.forEach { rule ->
+                    put(
+                        when (type) {
+                            RouteRuleType.KEYWORD -> RouteRule.keywordRegex(rule.value)
+                            RouteRuleType.IP_CIDR -> normalizeCidr(rule.value)
+                            else -> rule.value.trim().removePrefix("*.").removePrefix(".").lowercase()
+                        },
+                    )
+                }
             }
+            val cidr = valuesOf(RouteRuleType.IP_CIDR)
+            val suffix = valuesOf(RouteRuleType.DOMAIN_SUFFIX)
+            val keyword = valuesOf(RouteRuleType.KEYWORD)
+            if (cidr.length() > 0) merged.put(JSONObject().put("ip_cidr", cidr).put("outbound", outbound))
+            if (suffix.length() > 0) merged.put(JSONObject().put("domain_suffix", suffix).put("outbound", outbound))
+            if (keyword.length() > 0) merged.put(JSONObject().put("domain_regex", keyword).put("outbound", outbound))
         }
-        val result = JSONArray()
-        val suffix = valuesOf(RouteRuleType.DOMAIN_SUFFIX)
-        val keyword = valuesOf(RouteRuleType.KEYWORD)
-        val cidr = valuesOf(RouteRuleType.IP_CIDR)
-        if (suffix.length() > 0) result.put(JSONObject().put("domain_suffix", suffix).put("outbound", DIRECT_TAG))
-        if (keyword.length() > 0) result.put(JSONObject().put("domain_regex", keyword).put("outbound", DIRECT_TAG))
-        if (cidr.length() > 0) result.put(JSONObject().put("ip_cidr", cidr).put("outbound", DIRECT_TAG))
-        for (index in 0 until result.length()) merged.put(result.getJSONObject(index))
+        group(RouteAction.DIRECT, DIRECT_TAG)
+        group(RouteAction.PROXY, proxyOutbound)
+        // Per-app маршрут — после доменных/IP (см. комментарий к функции): ядро определяет
+        // приложение по UID соединения (package_name включает поиск процесса в router).
+        if (directPackages.isNotEmpty()) {
+            merged.put(JSONObject().put("package_name", JSONArray(directPackages)).put("outbound", DIRECT_TAG))
+        }
+        if (proxyPackages.isNotEmpty()) {
+            merged.put(JSONObject().put("package_name", JSONArray(proxyPackages)).put("outbound", proxyOutbound))
+        }
         return merged
+    }
+
+    /** «1.2.3.4» → «1.2.3.4/32», «::1» → «::1/128»: ядро ждёт префикс в ip_cidr. */
+    private fun normalizeCidr(raw: String): String {
+        val value = raw.trim()
+        if (value.contains('/')) return value
+        return if (value.contains(':')) "$value/128" else "$value/32"
     }
 
     private fun dnsOutbound(): JSONObject = JSONObject().put("type", "dns").put("tag", DNS_OUT_TAG)
@@ -313,16 +362,20 @@ object SingBoxConfigBuilder {
     private fun isIpLiteral(host: String): Boolean =
         host.contains(':') || Regex("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$").matches(host)
 
-    private fun createDnsRules(rules: List<RouteRule>, bootstrapHosts: List<String>): JSONArray {
+    private fun createDnsRules(rules: List<RouteRule>, bootstrapHosts: List<String>, directPackages: List<String> = emptyList()): JSONArray {
         val result = JSONArray()
         bootstrapDnsRule(bootstrapHosts)?.let { result.put(it) }
+        // DNS приложений с маршрутом DIRECT резолвим напрямую, а не через прокси-DNS.
+        if (directPackages.isNotEmpty()) {
+            result.put(JSONObject().put("package_name", JSONArray(directPackages)).put("server", DNS_DIRECT_TAG))
+        }
         val direct = rules.filter { it.action == RouteAction.DIRECT && it.type != RouteRuleType.IP_CIDR }
         if (direct.isEmpty()) return result
         fun valuesOf(type: RouteRuleType): JSONArray = JSONArray().apply {
             direct.filter { it.type == type }.forEach { rule ->
                 put(
                     if (type == RouteRuleType.KEYWORD) RouteRule.keywordRegex(rule.value)
-                    else rule.value.trim().removePrefix("*."),
+                    else rule.value.trim().removePrefix("*.").removePrefix(".").lowercase(),
                 )
             }
         }
@@ -348,6 +401,12 @@ object SingBoxConfigBuilder {
             .put("strict_route", true)
             .put("stack", "gvisor")
             .put("sniff", true)
+            // sniff=true: домен из TLS/HTTP-сниффа заполняет metadata.Domain, и доменные
+            // правила (DomainItem) матчатся через него, а не через Destination.Fqdn.
+            // sniff_override_destination НЕ ставим: при override Destination подменяется
+            // на FQDN, и ip_cidr-правила теряют исходный IP (DestinationAddresses пуст,
+            // domain_strategy не задан). Без override Destination остаётся исходным IP —
+            // ip_cidr матчится штатно, а доменные правила работают через metadata.Domain.
         if (selectedAppsOnly) tun.put("include_package", JSONArray(packages))
         if (directPackages.isNotEmpty()) tun.put("exclude_package", JSONArray(directPackages))
         return tun

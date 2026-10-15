@@ -62,13 +62,10 @@
             android:process=":vpn_awg"
             android:permission="android.permission.BIND_VPN_SERVICE" />
 
-        <receiver
-            android:name=".service.BootReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.intent.action.BOOT_COMPLETED" />
-            </intent-filter>
-        </receiver>
+        <!-- Сторож смахивания приложения из недавних: выключает VPN при полном закрытии. -->
+        <service
+            android:name=".service.AppTaskWatcherService"
+            android:exported="false" />
 
         <service
             android:name=".service.VibeTunTileService"

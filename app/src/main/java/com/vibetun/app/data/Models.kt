@@ -46,11 +46,42 @@ enum class ProxyMode(val label: String, val description: String) {
     SelectedApps("Выбранные приложения", "Применять прокси только к отмеченным приложениям."),
 }
 
+/**
+ * Маршрут приложений по умолчанию: PROXY — все приложения идут через VPN, кроме отмеченных
+ * DIRECT; DIRECT — все идут мимо VPN, кроме отмеченных PROXY. Для приложений через прокси
+ * домены/IP из раздела «Домены и IP» действуют поверх: домен DIRECT пойдёт напрямую и т.д.
+ */
+enum class AppDefaultRoute(val label: String) {
+    PROXY("Proxy"),
+    DIRECT("Direct"),
+}
+
 enum class ConnectionState {
     STOPPED,
     STARTING,
     RUNNING,
+
+    /**
+     * Остановка запрошена, служба закрывает ядро и TUN. Состояние пишет служба (и UI — сразу после
+     * запроса остановки), а STOPPED приходит только от службы: иначе UI показывал бы «Отключено»,
+     * пока VPN-ключ в шторке и туннель ещё живы.
+     */
+    STOPPING,
     ERROR,
+}
+
+/** Что делает тап по кнопке «Подключить/Отключить» или по плитке быстрых настроек. */
+enum class ConnectionAction { CONNECT, STOP, IGNORE }
+
+/**
+ * Тап не должен запускать подключение, пока идёт остановка или запуск: иначе stop и start
+ * гоняются между собой, и запоздавшая остановка убивает только что запущенную службу
+ * (в логах это выглядело как вечное «Подключение» до таймаута 60 с).
+ */
+fun ConnectionState.actionOnTap(): ConnectionAction = when (this) {
+    ConnectionState.RUNNING -> ConnectionAction.STOP
+    ConnectionState.STARTING, ConnectionState.STOPPING -> ConnectionAction.IGNORE
+    ConnectionState.STOPPED, ConnectionState.ERROR -> ConnectionAction.CONNECT
 }
 
 object ProtocolCatalog {

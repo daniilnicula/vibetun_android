@@ -6,7 +6,10 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.vibetun.app.service.ConnectionStateStore
 import com.vibetun.app.service.NativeCoreStatus
+import com.vibetun.app.service.VpnServiceLauncher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.getValue
@@ -26,11 +29,17 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         private set
     var proxyMode by mutableStateOf(if (store.selectedAppsOnly) ProxyMode.SelectedApps else ProxyMode.AllApps)
         private set
+    /** Маршрут приложений по умолчанию; хранится тем же флагом selectedAppsOnly (DIRECT = only). */
+    var appDefaultRoute by mutableStateOf(if (store.selectedAppsOnly) AppDefaultRoute.DIRECT else AppDefaultRoute.PROXY)
+        private set
     var selectedPackages by mutableStateOf(store.selectedAppPackages)
         private set
     var directPackages by mutableStateOf(store.directAppPackages)
         private set
     var launchAtBoot by mutableStateOf(store.launchAtBoot)
+        private set
+    /** Цвет акцента (ARGB); 0 — акцент по умолчанию для текущей темы. Хранится навсегда. */
+    var accentColorArgb by mutableStateOf(store.accentColorArgb)
         private set
     var installedApps by mutableStateOf<List<InstalledApp>>(emptyList())
         private set
@@ -61,6 +70,8 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
     private val routeSetStore = RouteSetStore(application)
 
     private var appsLoaded = false
+    /** Дебаунс автопереподключения при смене правил: стопим предыдущий отложенный restart. */
+    private var reconnectJob: Job? = null
 
     init {
         profiles.addAll(store.loadProfiles())
@@ -88,6 +99,10 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
 
     val isConnected: Boolean
         get() = connectionState == ConnectionState.RUNNING
+
+    /** Остановка запрошена, служба ещё не подтвердила STOPPED. */
+    val isStopping: Boolean
+        get() = connectionState == ConnectionState.STOPPING
 
     val isBatterySetupRecommended: Boolean
         get() = !batteryOptimizationExempt
@@ -152,7 +167,16 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
 
     fun updateProxyMode(mode: ProxyMode) {
         proxyMode = mode
+        appDefaultRoute = if (mode == ProxyMode.SelectedApps) AppDefaultRoute.DIRECT else AppDefaultRoute.PROXY
         store.selectedAppsOnly = mode == ProxyMode.SelectedApps
+    }
+
+    /** «По умолчанию для приложений»: PROXY — весь трафик в VPN кроме DIRECT-приложений,
+     *  DIRECT — мимо VPN кроме PROXY-приложений. */
+    fun updateAppDefaultRoute(route: AppDefaultRoute) {
+        appDefaultRoute = route
+        proxyMode = if (route == AppDefaultRoute.DIRECT) ProxyMode.SelectedApps else ProxyMode.AllApps
+        store.selectedAppsOnly = route == AppDefaultRoute.DIRECT
     }
 
     fun togglePackage(packageName: String) {
@@ -282,15 +306,19 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
 
     fun refreshRouteSets() {
         routeSetNames = routeSetStore.listSets()
-        if (activeRouteSet.isBlank() || activeRouteSet !in routeSetNames) {
-            activeRouteSet = routeSetNames.firstOrNull() ?: ""
-        }
+        // Читаем сохранённое имя набора; если его нет на диске — fallback на первый.
+        val saved = store.activeRouteSetName
+        val resolved = resolveActiveRouteSet(saved, routeSetNames)
+        activeRouteSet = resolved
+        if (saved != resolved) store.activeRouteSetName = resolved
         routeRules = activeRouteSet.takeIf { it.isNotBlank() }?.let { routeSetStore.load(it) } ?: emptyList()
     }
 
     fun switchRouteSet(setName: String) {
         activeRouteSet = setName
+        store.activeRouteSetName = setName
         routeRules = routeSetStore.load(setName)
+        scheduleReconnectIfRunning("смена набора маршрутов «$setName»")
     }
 
     fun addRouteRule(value: String, action: RouteAction) {
@@ -300,42 +328,72 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         if (routeRules.any { it.value.equals(trimmed, ignoreCase = true) }) {
-            feedback = "Такое правило уже есть в наборе."
+            feedback = "Такое правило уже есть в маршрутах."
             return
         }
-        if (activeRouteSet.isBlank()) activeRouteSet = "default"
+        if (activeRouteSet.isBlank()) {
+            activeRouteSet = "default"
+            store.activeRouteSetName = "default"
+        }
         routeRules = routeRules + RouteRule(trimmed, action)
         routeSetStore.save(activeRouteSet, routeRules)
         routeSetNames = routeSetStore.listSets()
+        scheduleReconnectIfRunning("добавление правила «$trimmed»")
     }
 
     fun removeRouteRule(rule: RouteRule) {
         routeRules = routeRules - rule
         if (activeRouteSet.isNotBlank()) routeSetStore.save(activeRouteSet, routeRules)
+        scheduleReconnectIfRunning("удаление правила «${rule.value}»")
     }
 
-    /** Экспорт активного набора в json-текст (для сохранения в файл). */
+    /** Экспорт активных маршрутов в json-текст (для сохранения в файл). */
     fun exportActiveRouteSet(): String? {
         if (activeRouteSet.isBlank()) {
-            feedback = "Нет активного набора правил."
+            feedback = "Нет активных маршрутов."
             return null
         }
         return routeSetStore.toJson(routeRules)
     }
 
-    /** Импорт набора из json-текста; имя набора берётся из переданного. */
+    /** Импорт маршрутов из json-текста; имя набора берётся из переданного. */
     fun importRouteSet(setName: String, text: String): Boolean {
         val rules = runCatching { routeSetStore.parseJson(text) }.getOrNull()
         if (rules == null) {
-            feedback = "Файл не похож на набор правил VibeTun."
+            feedback = "Файл не похож на маршруты VibeTun."
             return false
         }
         val name = setName.trim().ifBlank { "imported" }
         routeSetStore.save(name, rules)
         routeSetNames = routeSetStore.listSets()
-        switchRouteSet(name)
-        feedback = "Набор «$name» импортирован (${rules.size} правил)"
+        activeRouteSet = name
+        store.activeRouteSetName = name
+        routeRules = rules
+        feedback = "Маршруты «$name» импортированы (${rules.size} правил)"
+        scheduleReconnectIfRunning("импорт набора «$name»")
         return true
+    }
+
+    /**
+     * Если VPN сейчас работает — переподключаем с дебаунсом ~1 с, чтобы серия быстрых
+     * изменений правил (импорт, удаление, смена набора) не дёргала VPN каждый раз.
+     * Машина состояний: не запускаем при STARTING/STOPPING (см. ConnectionState.actionOnTap()).
+     */
+    private fun scheduleReconnectIfRunning(reason: String) {
+        if (connectionState != ConnectionState.RUNNING) return
+        reconnectJob?.cancel()
+        reconnectJob = viewModelScope.launch {
+            delay(RECONNECT_DEBOUNCE_MS)
+            if (connectionState != ConnectionState.RUNNING) return@launch
+            val profile = selectedProfile ?: return@launch
+            AppLog.i("ViewModel", "Переподключение VPN: $reason")
+            feedback = "Правила применены"
+            VpnServiceLauncher.start(getApplication(), profile)
+        }
+    }
+
+    companion object {
+        private const val RECONNECT_DEBOUNCE_MS = 1000L
     }
 
     // ==================== приложения: proxy / direct ====================
@@ -358,6 +416,11 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
     fun updateLaunchAtBoot(enabled: Boolean) {
         launchAtBoot = enabled
         store.launchAtBoot = enabled
+    }
+
+    fun updateAccentColor(argb: Int) {
+        accentColorArgb = argb
+        store.accentColorArgb = argb
     }
 
     private fun persistProfiles() = store.saveProfiles(profiles.toList())

@@ -75,8 +75,16 @@ private val LightGorePalette = GorePalette(
 val LocalGorePalette = staticCompositionLocalOf { DarkGorePalette }
 
 @Composable
-fun VibeTunTheme(darkTheme: Boolean, content: @Composable () -> Unit) {
-    val palette = if (darkTheme) DarkGorePalette else LightGorePalette
+fun VibeTunTheme(darkTheme: Boolean, accentColorArgb: Int = 0, content: @Composable () -> Unit) {
+    val base = if (darkTheme) DarkGorePalette else LightGorePalette
+    // Пользовательский акцент (если задан) заменяет акцент темы и его мягкую подложку;
+    // хранится в настройках и переживает перезапуск приложения.
+    val palette = if (accentColorArgb != 0) {
+        val accent = Color(accentColorArgb)
+        base.copy(accent = accent, accentSoft = accent.copy(alpha = 0.16f))
+    } else {
+        base
+    }
     val scheme = if (darkTheme) {
         darkColorScheme(
             primary = palette.accent,
