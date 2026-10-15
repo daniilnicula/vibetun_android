@@ -334,9 +334,12 @@ object SingBoxConfigBuilder {
 
     private fun dnsOutbound(): JSONObject = JSONObject().put("type", "dns").put("tag", DNS_OUT_TAG)
 
+    // НЕ «local»: на Android он ходит в системный DNS аплинка, который бывает сломан
+    // (логи: exchange failed ... name error для ozon.ru) и не умеет HTTPS-записи
+    // (no raw query support by current transport). Яндекс-DoH идёт напрямую и стабилен.
     private fun directDnsServer(): JSONObject = JSONObject()
         .put("tag", DNS_DIRECT_TAG)
-        .put("address", "local")
+        .put("address", "https://common.dot.dns.yandex.net/dns-query")
         .put("detour", DIRECT_TAG)
 
     /** Всегда есть прямой DNS: без него доменный адрес сервера резолвится через ещё не поднятый прокси. */

@@ -347,6 +347,14 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         scheduleReconnectIfRunning("удаление правила «${rule.value}»")
     }
 
+    /** Переключение действия правила PROXY ↔ DIRECT одним нажатием на его метку. */
+    fun toggleRouteRuleAction(rule: RouteRule) {
+        val next = if (rule.action == RouteAction.DIRECT) RouteAction.PROXY else RouteAction.DIRECT
+        routeRules = routeRules.map { if (it == rule) it.copy(action = next) else it }
+        if (activeRouteSet.isNotBlank()) routeSetStore.save(activeRouteSet, routeRules)
+        scheduleReconnectIfRunning("смена действия правила «${rule.value}» на $next")
+    }
+
     /** Экспорт активных маршрутов в json-текст (для сохранения в файл). */
     fun exportActiveRouteSet(): String? {
         if (activeRouteSet.isBlank()) {

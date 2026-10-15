@@ -717,6 +717,57 @@ private fun RoutingPage(
                     modifier = Modifier.padding(top = 8.dp),
                 )
 
+                // строка добавления: [поле ввода] [PROXY] [DIRECT] [Добавить]
+                Row(Modifier.padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = ruleInput,
+                        onValueChange = { ruleInput = it },
+                        placeholder = { Text("Домен, IP или ключевое слово", fontSize = 11.sp) },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(7.dp))
+                    listOf(RouteAction.PROXY, RouteAction.DIRECT).forEach { action ->
+                        val selected = ruleAction == action
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable { ruleAction = action },
+                            color = if (selected) (if (action == RouteAction.DIRECT) p.warningSoft else p.accentSoft) else p.cardAlt,
+                            border = BorderStroke(1.dp, if (selected) (if (action == RouteAction.DIRECT) p.warning else p.accent) else p.border),
+                        ) {
+                            Text(
+                                if (action == RouteAction.DIRECT) "DIRECT" else "PROXY",
+                                color = if (selected) (if (action == RouteAction.DIRECT) p.warning else p.accent) else p.textMuted,
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
+                            )
+                        }
+                        Spacer(Modifier.width(5.dp))
+                    }
+                    Surface(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable {
+                                viewModel.addRouteRule(ruleInput, ruleAction)
+                                ruleInput = ""
+                            },
+                        color = p.accentSoft,
+                        border = BorderStroke(1.dp, p.accent),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        ) {
+                            Icon(Icons.Outlined.Add, contentDescription = null, tint = p.accent, modifier = Modifier.size(12.dp))
+                            Spacer(Modifier.width(3.dp))
+                            Text("Добавить", color = p.accent, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                        }
+                    }
+                }
+
+                // добавленные правила — под строкой добавления
                 viewModel.routeRules.forEach { rule ->
                     Row(
                         Modifier.fillMaxWidth().padding(top = 8.dp),
@@ -733,6 +784,7 @@ private fun RoutingPage(
                         StatusTag(
                             text = if (rule.action == RouteAction.DIRECT) "DIRECT" else "PROXY",
                             tone = if (rule.action == RouteAction.DIRECT) p.warning else p.success,
+                            onClick = { viewModel.toggleRouteRuleAction(rule) },
                         )
                         Spacer(Modifier.width(6.dp))
                         IconButton(
@@ -741,49 +793,6 @@ private fun RoutingPage(
                         ) {
                             Icon(Icons.Outlined.Close, contentDescription = "Удалить правило", tint = p.textMuted, modifier = Modifier.size(15.dp))
                         }
-                    }
-                }
-
-                Row(Modifier.padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedTextField(
-                        value = ruleInput,
-                        onValueChange = { ruleInput = it },
-                        placeholder = { Text("Домен, IP или ключевое слово", fontSize = 11.sp) },
-                        singleLine = true,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Spacer(Modifier.width(7.dp))
-                    Column {
-                        Row {
-                            listOf(RouteAction.DIRECT, RouteAction.PROXY).forEach { action ->
-                                val selected = ruleAction == action
-                                Surface(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .clickable { ruleAction = action },
-                                    color = if (selected) (if (action == RouteAction.DIRECT) p.warningSoft else p.accentSoft) else p.cardAlt,
-                                    border = BorderStroke(1.dp, if (selected) (if (action == RouteAction.DIRECT) p.warning else p.accent) else p.border),
-                                ) {
-                                    Text(
-                                        if (action == RouteAction.DIRECT) "DIRECT" else "PROXY",
-                                        color = if (selected) (if (action == RouteAction.DIRECT) p.warning else p.accent) else p.textMuted,
-                                        fontSize = 9.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                                    )
-                                }
-                                Spacer(Modifier.width(5.dp))
-                            }
-                        }
-                        Spacer(Modifier.height(5.dp))
-                        SecondaryActionButton(
-                            label = "Добавить",
-                            icon = Icons.Outlined.Add,
-                            onClick = {
-                                viewModel.addRouteRule(ruleInput, ruleAction)
-                                ruleInput = ""
-                            },
-                        )
                     }
                 }
 
@@ -1360,11 +1369,12 @@ private fun PanelCard(modifier: Modifier = Modifier, content: @Composable () -> 
 }
 
 @Composable
-private fun StatusTag(text: String, tone: Color) {
+private fun StatusTag(text: String, tone: Color, onClick: (() -> Unit)? = null) {
     val p = LocalGorePalette.current
     Box(
         Modifier
             .clip(RoundedCornerShape(5.dp))
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
             .background(tone.copy(alpha = if (p.window == Color(0xFF191B1D)) 0.13f else 0.1f))
             .padding(horizontal = 6.dp, vertical = 3.dp),
     ) {
