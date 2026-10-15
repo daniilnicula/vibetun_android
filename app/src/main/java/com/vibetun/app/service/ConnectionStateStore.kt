@@ -69,7 +69,12 @@ class ConnectionStateStore(context: Context) {
     val recordedBy: String?
         get() = readFromFile()?.owner
 
-    fun update(state: ConnectionState, message: String = "") {
+    /** Id профиля, которым реально поднят туннель (пишет служба при RUNNING). Пусто — нет. */
+    val activeProfileId: String?
+        get() = readFromFile()?.activeProfileId
+            ?: prefs.getString(KEY_ACTIVE_PROFILE, null)?.takeIf { it.isNotBlank() }
+
+    fun update(state: ConnectionState, message: String = "", activeProfileId: String? = null) {
         val previous = readFromFile()
         AppLog.i("State", "${previous?.state ?: "—"} -> $state${if (message.isNotBlank()) " ($message)" else ""}")
         if (!mayWriteConnectionState(previous?.state, previous?.owner, state, owner)) {
@@ -79,9 +84,19 @@ class ConnectionStateStore(context: Context) {
             )
             return
         }
+        // Активный профиль: явное значение имеет приоритет; терминальные состояния его сбрасывают;
+        // иначе сохраняем прежнее (UI пишет STARTING/STOPPING, не зная id профиля).
+        val newActiveProfileId = when {
+            activeProfileId != null -> activeProfileId
+            state == ConnectionState.STOPPED || state == ConnectionState.ERROR -> null
+            else -> previous?.activeProfileId
+        }
         runCatching {
             val tmp = File(stateFile.parentFile, stateFile.name + ".tmp")
-            tmp.writeText(state.name + "\n" + message.replace('\n', ' ') + "\n" + OWNER_PREFIX + owner + "\n")
+            tmp.writeText(
+                state.name + "\n" + message.replace('\n', ' ') + "\n" + OWNER_PREFIX + owner + "\n" +
+                    PROFILE_PREFIX + (newActiveProfileId ?: "") + "\n",
+            )
             if (!tmp.renameTo(stateFile)) {
                 stateFile.delete()
                 tmp.renameTo(stateFile)
@@ -90,11 +105,13 @@ class ConnectionStateStore(context: Context) {
         prefs.edit()
             .putString(KEY_STATE, state.name)
             .putString(KEY_MESSAGE, message)
+            .putString(KEY_ACTIVE_PROFILE, newActiveProfileId ?: "")
             .apply()
         appContext.sendBroadcast(
             Intent(ACTION_STATE_CHANGED).setPackage(appContext.packageName)
                 .putExtra(EXTRA_STATE, state.name)
-                .putExtra(EXTRA_MESSAGE, message),
+                .putExtra(EXTRA_MESSAGE, message)
+                .putExtra(EXTRA_ACTIVE_PROFILE, newActiveProfileId ?: ""),
         )
         runCatching {
             TileService.requestListeningState(
@@ -103,17 +120,24 @@ class ConnectionStateStore(context: Context) {
             )
         }
     }
-    private data class Snapshot(val state: ConnectionState, val message: String, val owner: String?)
+    private data class Snapshot(
+        val state: ConnectionState,
+        val message: String,
+        val owner: String?,
+        val activeProfileId: String?,
+    )
 
     private fun readFromFile(): Snapshot? = runCatching {
         if (!stateFile.isFile) return@runCatching null
         val lines = stateFile.readLines()
         val parsedState = ConnectionState.valueOf(lines.firstOrNull().orEmpty())
         val ownerLine = lines.getOrNull(2)?.takeIf { it.startsWith(OWNER_PREFIX) }
+        val profileLine = lines.getOrNull(3)?.takeIf { it.startsWith(PROFILE_PREFIX) }
         Snapshot(
             state = parsedState,
             message = lines.getOrNull(1).orEmpty(),
             owner = ownerLine?.removePrefix(OWNER_PREFIX)?.takeIf { it.isNotBlank() },
+            activeProfileId = profileLine?.removePrefix(PROFILE_PREFIX)?.takeIf { it.isNotBlank() },
         )
     }.getOrNull()
 
@@ -121,6 +145,8 @@ class ConnectionStateStore(context: Context) {
         const val ACTION_STATE_CHANGED = "com.vibetun.app.CONNECTION_STATE_CHANGED"
         const val EXTRA_STATE = "state"
         const val EXTRA_MESSAGE = "message"
+        /** Id профиля, которым реально поднят туннель; пустая строка — туннеля нет. */
+        const val EXTRA_ACTIVE_PROFILE = "active_profile"
         /** Сколько ждём перехода из STARTING, прежде чем признать подключение зависшим. */
         const val START_TIMEOUT_MS = 60_000L
         /** Сколько ждём подтверждения остановки (STOPPING -> STOPPED), прежде чем гасить процесс. */
@@ -128,7 +154,9 @@ class ConnectionStateStore(context: Context) {
         /** Владелец записи — UI/плитка (их запрос никогда не отклоняется). */
         const val OWNER_UI = "main"
         private const val OWNER_PREFIX = "owner="
+        private const val PROFILE_PREFIX = "profile="
         private const val KEY_STATE = "state"
         private const val KEY_MESSAGE = "message"
+        private const val KEY_ACTIVE_PROFILE = "active_profile"
     }
 }

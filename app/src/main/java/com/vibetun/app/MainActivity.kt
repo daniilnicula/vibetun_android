@@ -43,6 +43,7 @@ class MainActivity : ComponentActivity() {
                 viewModel.onConnectionStateFromService(
                     state,
                     intent.getStringExtra(ConnectionStateStore.EXTRA_MESSAGE).orEmpty(),
+                    intent.getStringExtra(ConnectionStateStore.EXTRA_ACTIVE_PROFILE)?.takeIf { it.isNotBlank() },
                 )
             } else {
                 viewModel.refreshConnectionState()

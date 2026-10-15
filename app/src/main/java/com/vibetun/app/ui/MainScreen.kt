@@ -380,7 +380,7 @@ private fun ProfilesPage(
                     ProfileRow(
                         profile = profile,
                         selected = profile.id == viewModel.selectedProfileId,
-                        connected = viewModel.isConnected && profile.id == viewModel.selectedProfileId,
+                        connected = viewModel.isConnected && profile.id == viewModel.activeProfileId,
                         pinging = profile.id in viewModel.pingingIds,
                         onSelect = { viewModel.selectProfile(profile.id) },
                         onEdit = { onEdit(profile) },
@@ -437,9 +437,14 @@ private fun ConnectionCard(viewModel: VibeTunViewModel, onConnect: () -> Unit) {
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.padding(top = 10.dp),
             )
+            // Пока VPN работает показываем профиль АКТИВНОГО туннеля (пишет служба),
+            // а не просто выбранный: иначе при смене выбора UI врал бы про протокол.
             val selected = viewModel.selectedProfile
+            val displayedProfile = if (state == ConnectionState.RUNNING || state == ConnectionState.STARTING) {
+                viewModel.activeProfile ?: selected
+            } else selected
             Text(
-                text = selected?.let { "${it.protocolLabel}  ·  ${it.endpoint}" } ?: "Выберите профиль, чтобы начать",
+                text = displayedProfile?.let { "${it.protocolLabel}  ·  ${it.endpoint}" } ?: "Выберите профиль, чтобы начать",
                 color = p.textSecondary,
                 fontSize = 12.sp,
                 maxLines = 1,
@@ -483,7 +488,7 @@ private fun ConnectionCard(viewModel: VibeTunViewModel, onConnect: () -> Unit) {
             ) {
                 MiniMetric(
                     title = "ПРОФИЛЬ",
-                    value = selected?.protocolLabel ?: "не выбран",
+                    value = displayedProfile?.protocolLabel ?: "не выбран",
                     modifier = Modifier.weight(1f),
                 )
                 MiniMetric(
@@ -722,7 +727,8 @@ private fun RoutingPage(
                 OutlinedTextField(
                     value = ruleInput,
                     onValueChange = { ruleInput = it },
-                    placeholder = { Text("Домен, IP или ключевое слово", fontSize = 11.sp) },
+                    placeholder = { Text("Домен, IP или ключевое слово", fontSize = 12.sp) },
+                    textStyle = MaterialTheme.typography.bodySmall.copy(color = p.text, fontSize = 13.sp),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
                 )
@@ -730,10 +736,12 @@ private fun RoutingPage(
                     listOf(RouteAction.PROXY, RouteAction.DIRECT).forEach { action ->
                         val selected = ruleAction == action
                         Surface(
+                            // shape задаём самому Surface: рамка (border) рисуется по shape,
+                            // а clip() до Surface резал только фон — окантовка оставалась квадратной.
                             modifier = Modifier
                                 .weight(1f)
-                                .clip(RoundedCornerShape(7.dp))
                                 .clickable { ruleAction = action },
+                            shape = RoundedCornerShape(7.dp),
                             color = if (selected) (if (action == RouteAction.DIRECT) p.warningSoft else p.accentSoft) else p.cardAlt,
                             border = BorderStroke(1.dp, if (selected) (if (action == RouteAction.DIRECT) p.warning else p.accent) else p.border),
                         ) {
@@ -750,11 +758,11 @@ private fun RoutingPage(
                     Surface(
                         modifier = Modifier
                             .weight(1f)
-                            .clip(RoundedCornerShape(7.dp))
                             .clickable {
                                 viewModel.addRouteRule(ruleInput, ruleAction)
                                 ruleInput = ""
                             },
+                        shape = RoundedCornerShape(7.dp),
                         color = p.accentSoft,
                         border = BorderStroke(1.dp, p.accent),
                     ) {
@@ -779,7 +787,7 @@ private fun RoutingPage(
                         Text(
                             rule.value,
                             color = p.text,
-                            fontSize = 11.sp,
+                            fontSize = 13.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f),
@@ -958,7 +966,10 @@ private fun AppRouteChip(
 ) {
     val p = LocalGorePalette.current
     Surface(
-        modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable(onClick = onClick),
+        // см. строку добавления правил: border рисуется по shape самого Surface,
+        // внешний clip() её не скруглял.
+        modifier = Modifier.clickable(onClick = onClick),
+        shape = RoundedCornerShape(6.dp),
         color = if (selected) activeSoft else p.cardAlt,
         border = BorderStroke(1.dp, if (selected) activeColor else p.border),
     ) {
@@ -1344,8 +1355,8 @@ private fun SearchInput(value: String, onValueChange: (String) -> Unit, placehol
         modifier = modifier.fillMaxWidth(),
         singleLine = true,
         leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null, tint = p.textMuted, modifier = Modifier.size(18.dp)) },
-        placeholder = { Text(placeholder, fontSize = 11.sp, color = p.textMuted) },
-        textStyle = MaterialTheme.typography.bodySmall.copy(color = p.text, fontSize = 11.sp),
+        placeholder = { Text(placeholder, fontSize = 12.sp, color = p.textMuted) },
+        textStyle = MaterialTheme.typography.bodySmall.copy(color = p.text, fontSize = 13.sp),
         shape = RoundedCornerShape(9.dp),
         colors = OutlinedTextFieldDefaults.colors(
             focusedTextColor = p.text,

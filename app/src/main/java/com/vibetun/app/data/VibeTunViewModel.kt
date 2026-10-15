@@ -47,6 +47,10 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         private set
     var connectionMessage by mutableStateOf(connectionStore.message)
         private set
+    /** Профиль, которым реально поднят туннель (пишет служба). Отличается от выбранного,
+     *  пока пользователь при живом подключении ткнул другой профиль — до переподключения. */
+    var activeProfileId by mutableStateOf(connectionStore.activeProfileId)
+        private set
     var feedback by mutableStateOf<String?>(null)
     var powerDialogVisible by mutableStateOf(!store.powerOnboardingComplete)
         private set
@@ -85,6 +89,10 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
 
     val selectedProfile: ProxyProfile?
         get() = profiles.firstOrNull { it.id == selectedProfileId }
+
+    /** Профиль активного туннеля; UI обязан показывать его, а не выбранный, пока VPN работает. */
+    val activeProfile: ProxyProfile?
+        get() = profiles.firstOrNull { it.id == activeProfileId }
 
     val visibleProfiles: List<ProxyProfile>
         get() {
@@ -137,10 +145,16 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         feedback = "Профиль сохранён"
     }
 
-    fun selectProfile(id: String) {
+    fun selectProfile(id: String, reconnectIfRunning: Boolean = true) {
         if (profiles.none { it.id == id }) return
+        val previous = selectedProfileId
         selectedProfileId = id
         store.selectedProfileId = id
+        // Смена выбора при живом подключении раньше ничего не делала: UI показывал новый
+        // профиль как «подключённый», а туннель оставался старого. Теперь — переподключение.
+        if (reconnectIfRunning && previous != id && connectionState == ConnectionState.RUNNING) {
+            scheduleReconnectIfRunning("смена профиля", "Переключаем профиль…")
+        }
     }
 
     fun toggleFavorite(profile: ProxyProfile) {
@@ -153,6 +167,7 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
     fun removeProfile(profile: ProxyProfile) {
         profiles.removeAll { it.id == profile.id }
         if (selectedProfileId == profile.id) {
+            // Удаление — не пользовательская смена выбора: переподключение не дёргаем.
             selectedProfileId = profiles.firstOrNull()?.id.orEmpty()
             store.selectedProfileId = selectedProfileId
         }
@@ -225,12 +240,14 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
     fun refreshConnectionState() {
         connectionState = connectionStore.state
         connectionMessage = connectionStore.message
+        activeProfileId = connectionStore.activeProfileId
     }
 
     /** Тихое обновление полей из broadcast сервиса :vpn — без записи в prefs и реброадкаста. */
-    fun onConnectionStateFromService(state: ConnectionState, message: String) {
+    fun onConnectionStateFromService(state: ConnectionState, message: String, activeProfileId: String? = null) {
         connectionState = state
         connectionMessage = message
+        this.activeProfileId = activeProfileId ?: connectionStore.activeProfileId
     }
 
     fun setConnectionState(state: ConnectionState, message: String = "") {
@@ -387,7 +404,7 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
      * изменений правил (импорт, удаление, смена набора) не дёргала VPN каждый раз.
      * Машина состояний: не запускаем при STARTING/STOPPING (см. ConnectionState.actionOnTap()).
      */
-    private fun scheduleReconnectIfRunning(reason: String) {
+    private fun scheduleReconnectIfRunning(reason: String, feedbackText: String = "Правила применены") {
         if (connectionState != ConnectionState.RUNNING) return
         reconnectJob?.cancel()
         reconnectJob = viewModelScope.launch {
@@ -395,7 +412,7 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
             if (connectionState != ConnectionState.RUNNING) return@launch
             val profile = selectedProfile ?: return@launch
             AppLog.i("ViewModel", "Переподключение VPN: $reason")
-            feedback = "Правила применены"
+            feedback = feedbackText
             VpnServiceLauncher.start(getApplication(), profile)
         }
     }

@@ -331,10 +331,10 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
             }
             if (profile.protocol.equals("amneziawg", ignoreCase = true)) {
                 startAmneziaWg(profile)
-                stateStore.update(ConnectionState.STARTING, "Ожидание handshake с сервером…")
+                stateStore.update(ConnectionState.STARTING, "Ожидание handshake с сервером…", profile.id)
             } else {
                 startSingBox(profile)
-                stateStore.update(ConnectionState.RUNNING, "Прокси включён · ${profile.name}")
+                stateStore.update(ConnectionState.RUNNING, "Прокси включён · ${profile.name}", profile.id)
             }
             profileStore.proxyWasActive = true
             Log.i(TAG, "Proxy core started for profile ${profile.id} (${profile.protocol})")
@@ -372,7 +372,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         val routeSetName = activeRouteSet()
         val rules = RouteSetStore(this).load(routeSetName)
         AppLog.i(TAG, "startSingBox: сборка конфигурации… набор=«$routeSetName», правил=${rules.size}")
-        AppLog.i(TAG, "startSingBox: DNS — прямой=vibetun-dns-direct (address:local), reverse_mapping=true, strategy=ipv4_only. Проверка: в core.log (debug) строки «match[N] ip_cidr=… => vibetun-direct» / «domain_suffix=… => vibetun-direct» подтверждают работу DIRECT-правил; ошибки DNS — «failed to resolve»")
+        AppLog.i(TAG, "startSingBox: DNS — прямой=vibetun-dns-direct (DoH common.dot.dns.yandex.net, резолвер 77.88.8.8), reverse_mapping=true, strategy=ipv4_only. Проверка: в core.log (debug) строки «match[N] ip_cidr=… => vibetun-direct» / «domain_suffix=… => vibetun-direct» подтверждают работу DIRECT-правил; ошибки DNS — «failed to resolve»")
         val config = SingBoxConfigBuilder.build(
             profile = profile,
             selectedPackages = profileStore.selectedAppPackages,
@@ -516,7 +516,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
                 if (handshakeSec > 0L) {
                     AppLog.i(TAG, "AmneziaWG: handshake с сервером установлен, туннель активен")
                     if (amneziaHandle == handle) {
-                        stateStore.update(ConnectionState.RUNNING, "Прокси включён · ${profile.name}")
+                        stateStore.update(ConnectionState.RUNNING, "Прокси включён · ${profile.name}", profile.id)
                     }
                     return@Thread
                 }
@@ -610,10 +610,22 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     private fun loadSelectedProfile(): ProxyProfile {
         val requested = requestedProfileId
         requestedProfileId = null
-        val profiles = profileStore.loadProfiles()
-        val selectedId = requested ?: profileStore.selectedProfileId
-        return profiles.firstOrNull { it.id == selectedId }
-            ?: throw IllegalStateException("Профиль не найден. Откройте VibeTun и выберите профиль.")
+        // MODE_MULTI_PROCESS prefs: свежеподнятый процесс службы может прочитать протухший
+        // снапшот (запись apply() из UI ещё не доехала до диска) и честно не найти профиль.
+        // По логам такой случай реален, поэтому перед ошибкой — повторные попытки с паузой.
+        repeat(3) { attempt ->
+            val profiles = profileStore.loadProfiles()
+            val selectedId = requested ?: profileStore.selectedProfileId
+            profiles.firstOrNull { it.id == selectedId }?.let { return it }
+            if (attempt < 2) {
+                AppLog.i(
+                    TAG,
+                    "loadSelectedProfile: «$selectedId» не найден (попытка ${attempt + 1}/3, в store ${profiles.size} профилей) — ждём синхронизации prefs",
+                )
+                Thread.sleep(300)
+            }
+        }
+        throw IllegalStateException("Профиль не найден. Откройте VibeTun и выберите профиль.")
     }
 
     private fun fail(message: String) {
