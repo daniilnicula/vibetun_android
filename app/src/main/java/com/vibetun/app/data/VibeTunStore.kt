@@ -5,18 +5,64 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-/** Small private on-device store; profile credentials never leave the app. */
+/**
+ * Small private on-device store; profile credentials never leave the app.
+ *
+ * Все ключи, которые читают процессы службы (:vpn / :vpn_awg), живут в файле с
+ * атомарной записью (tmp + rename), а не в SharedPreferences: MODE_MULTI_PROCESS
+ * между процессами не гарантирует ни свежесть чтений, ни целостность записей —
+ * commit() из процесса службы пишет на диск весь свой протухший кэш и затирает
+ * свежие данные UI (по логам так исчезал профиль, добавленный импортом подписки:
+ * «в store 3 профилей», а выбранного id среди них нет). Файл читается заново при
+ * каждом обращении — оба процесса всегда видят одно и то же состояние.
+ *
+ * UI-only ключи (тема, акцент, онбординг) остаются в prefs.
+ */
 @Suppress("DEPRECATION")
 class VibeTunStore(context: Context) {
     private val appContext = context.applicationContext
 
-    // MODE_MULTI_PROCESS: сервис живёт в процессе :vpn, а SharedPreferences кэшируются
-    // per-process — без этого флага сервис видит протухший снапшот (профили, выбор,
-    // списки приложений). Записи редкие, флага достаточно.
     private val preferences = appContext.getSharedPreferences("vibetun", Context.MODE_MULTI_PROCESS)
 
+    private val storeFile: File get() = File(appContext.filesDir, STORE_FILE)
+
+    private fun readFileJson(): JSONObject = runCatching {
+        if (!storeFile.isFile) return JSONObject()
+        JSONObject(storeFile.readText())
+    }.getOrDefault(JSONObject())
+
+    private fun writeFileJson(json: JSONObject) {
+        runCatching {
+            val tmp = File(storeFile.parentFile, storeFile.name + ".tmp")
+            tmp.writeText(json.toString())
+            if (!tmp.renameTo(storeFile)) {
+                storeFile.delete()
+                tmp.renameTo(storeFile)
+            }
+        }
+    }
+
+    private var migrated = false
+
+    /** Одноразовая миграция: файл — источник истины, при первом обращении
+     *  заполняем его актуальными значениями из prefs старых сборок. */
+    private fun migrateIfNeeded() {
+        if (migrated) return
+        migrated = true
+        if (storeFile.isFile) return
+        val json = JSONObject()
+        json.put(KEY_PROFILES, preferences.getString(KEY_PROFILES, "[]") ?: "[]")
+        json.put(KEY_SELECTED_PROFILE, preferences.getString(KEY_SELECTED_PROFILE, "").orEmpty())
+        json.put(KEY_SELECTED_APPS, JSONArray(preferences.getStringSet(KEY_SELECTED_APPS, emptySet()).orEmpty().sorted()))
+        json.put(KEY_SELECTED_APPS_ONLY, preferences.getBoolean(KEY_SELECTED_APPS_ONLY, false))
+        json.put(KEY_DIRECT_APPS, JSONArray(preferences.getStringSet(KEY_DIRECT_APPS, emptySet()).orEmpty().sorted()))
+        json.put(KEY_ACTIVE_ROUTE_SET, preferences.getString(KEY_ACTIVE_ROUTE_SET, "").orEmpty())
+        writeFileJson(json)
+    }
+
     fun loadProfiles(): List<ProxyProfile> {
-        val raw = preferences.getString(KEY_PROFILES, "[]") ?: "[]"
+        migrateIfNeeded()
+        val raw = readFileJson().optString(KEY_PROFILES, "[]")
         return runCatching {
             val array = JSONArray(raw)
             buildList {
@@ -41,6 +87,7 @@ class VibeTunStore(context: Context) {
     }
 
     fun saveProfiles(profiles: List<ProxyProfile>) {
+        migrateIfNeeded()
         val array = JSONArray()
         profiles.forEach { profile ->
             array.put(
@@ -55,27 +102,49 @@ class VibeTunStore(context: Context) {
                     .put("favorite", profile.favorite),
             )
         }
-        preferences.edit().putString(KEY_PROFILES, array.toString()).apply()
+        val json = readFileJson().put(KEY_PROFILES, array)
+        writeFileJson(json)
     }
 
     var selectedProfileId: String
-        get() = preferences.getString(KEY_SELECTED_PROFILE, "").orEmpty()
-        set(value) { preferences.edit().putString(KEY_SELECTED_PROFILE, value).apply() }
+        get() {
+            migrateIfNeeded()
+            return readFileJson().optString(KEY_SELECTED_PROFILE, "")
+        }
+        set(value) {
+            migrateIfNeeded()
+            writeFileJson(readFileJson().put(KEY_SELECTED_PROFILE, value))
+        }
 
     var darkTheme: Boolean
         get() = preferences.getBoolean(KEY_DARK_THEME, true)
         set(value) { preferences.edit().putBoolean(KEY_DARK_THEME, value).apply() }
 
-    // Маршрутизацию читает процесс службы (:vpn/:vpn_awg) сразу после старта, а apply()
-    // сбрасывает данные на диск асинхронно — служба могла прочитать протухший снапшот,
-    // и per-app правила «не применялись». Поэтому здесь только синхронный commit().
+    // Маршрутизацию по приложениям читает процесс службы (:vpn/:vpn_awg) при старте ядра —
+    // только файловое хранилище (см. заголовок класса): иначе per-app правила либо «не
+    // применялись» (протухший снапшот), либо затирались чужим commit().
+
     var selectedAppPackages: Set<String>
-        get() = preferences.getStringSet(KEY_SELECTED_APPS, emptySet())?.toSet().orEmpty()
-        set(value) { preferences.edit().putStringSet(KEY_SELECTED_APPS, value.toSet()).commit() }
+        get() {
+            migrateIfNeeded()
+            return readFileJson().optJSONArray(KEY_SELECTED_APPS)?.let { array ->
+                (0 until array.length()).mapTo(mutableSetOf()) { array.optString(it) }
+            }.orEmpty()
+        }
+        set(value) {
+            migrateIfNeeded()
+            writeFileJson(readFileJson().put(KEY_SELECTED_APPS, JSONArray(value.sorted())))
+        }
 
     var selectedAppsOnly: Boolean
-        get() = preferences.getBoolean(KEY_SELECTED_APPS_ONLY, false)
-        set(value) { preferences.edit().putBoolean(KEY_SELECTED_APPS_ONLY, value).commit() }
+        get() {
+            migrateIfNeeded()
+            return readFileJson().optBoolean(KEY_SELECTED_APPS_ONLY, false)
+        }
+        set(value) {
+            migrateIfNeeded()
+            writeFileJson(readFileJson().put(KEY_SELECTED_APPS_ONLY, value))
+        }
 
     /** Цвет акцента приложения (ARGB); 0 — акцент по умолчанию для текущей темы. */
     var accentColorArgb: Int
@@ -94,10 +163,7 @@ class VibeTunStore(context: Context) {
      * Запоминание состояния: VPN работал при последнем завершении — включить после перезагрузки.
      *
      * Флаг пишется из процессов `:vpn` / `:vpn_awg` (часто прямо перед kill процесса) и читается
-     * UI и службой, поэтому основное хранилище — файл с
-     * атомарной записью (tmp + rename): SharedPreferences кэшируются per-process, а commit()
-     * при MODE_MULTI_PROCESS между процессами не гарантирован. Prefs дублируются для совместимости
-     * с уже установленными сборками.
+     * UI и службой, поэтому основное хранилище — файл с атомарной записью (tmp + rename).
      */
     var proxyWasActive: Boolean
         get() = runCatching {
@@ -121,18 +187,32 @@ class VibeTunStore(context: Context) {
     private val proxyWasActiveFile: File
         get() = File(appContext.filesDir, PROXY_WAS_ACTIVE_FILE)
 
-    /** Имя активного набора правил маршрутизации (файл routes/<имя>.json).
-     *  Служба :vpn читает при старте ядра; commit() чтобы процесс видел актуальное значение. */
+    /** Имя активного набора правил маршрутизации (файл routes/<имя>.json). Служба читает при старте ядра. */
     var activeRouteSetName: String
-        get() = preferences.getString(KEY_ACTIVE_ROUTE_SET, "").orEmpty()
-        set(value) { preferences.edit().putString(KEY_ACTIVE_ROUTE_SET, value).commit() }
+        get() {
+            migrateIfNeeded()
+            return readFileJson().optString(KEY_ACTIVE_ROUTE_SET, "")
+        }
+        set(value) {
+            migrateIfNeeded()
+            writeFileJson(readFileJson().put(KEY_ACTIVE_ROUTE_SET, value))
+        }
 
-    /** Приложения с маршрутом DIRECT: идут мимо туннеля (exclude). */
+    /** Приложения с маршрутом DIRECT: идут мимо туннеля (exclude). Служба читает при старте ядра. */
     var directAppPackages: Set<String>
-        get() = preferences.getStringSet(KEY_DIRECT_APPS, emptySet())?.toSet().orEmpty()
-        set(value) { preferences.edit().putStringSet(KEY_DIRECT_APPS, value.toSet()).commit() }
+        get() {
+            migrateIfNeeded()
+            return readFileJson().optJSONArray(KEY_DIRECT_APPS)?.let { array ->
+                (0 until array.length()).mapTo(mutableSetOf()) { array.optString(it) }
+            }.orEmpty()
+        }
+        set(value) {
+            migrateIfNeeded()
+            writeFileJson(readFileJson().put(KEY_DIRECT_APPS, JSONArray(value.sorted())))
+        }
 
     companion object {
+        private const val STORE_FILE = "vibetun_store.json"
         private const val KEY_PROFILES = "profiles"
         private const val KEY_SELECTED_PROFILE = "selected_profile"
         private const val KEY_DARK_THEME = "dark_theme"

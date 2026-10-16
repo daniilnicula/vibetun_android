@@ -319,6 +319,9 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         try {
             val profile = loadSelectedProfile()
             logStartHeader(profile)
+            val storeProfiles = profileStore.loadProfiles()
+            val storeSnapshot = storeProfiles.joinToString(", ") { "${it.id.take(8)}:${it.protocol}" }
+            AppLog.i(TAG, "store: профилей=${storeProfiles.size}: $storeSnapshot")
             AppLog.i(TAG, "startConnection: профиль ${profile.id} (${profile.protocol}) ${profile.name}")
             // Служба обязана соответствовать семейству ядра профиля (см. VpnServiceLauncher).
             val family = familyOf(profile.protocol)
@@ -618,9 +621,10 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
             val selectedId = requested ?: profileStore.selectedProfileId
             profiles.firstOrNull { it.id == selectedId }?.let { return it }
             if (attempt < 2) {
+                val ids = profiles.joinToString(", ") { it.id.take(8) }
                 AppLog.i(
                     TAG,
-                    "loadSelectedProfile: «$selectedId» не найден (попытка ${attempt + 1}/3, в store ${profiles.size} профилей) — ждём синхронизации prefs",
+                    "loadSelectedProfile: «$selectedId» не найден (попытка ${attempt + 1}/3, в store ${profiles.size} профилей: $ids) — ждём синхронизации",
                 )
                 Thread.sleep(300)
             }
