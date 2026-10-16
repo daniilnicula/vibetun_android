@@ -25,6 +25,7 @@ import com.vibetun.app.MainActivity
 import com.vibetun.app.R
 import com.vibetun.app.data.AmneziaWgConfig
 import com.vibetun.app.data.AppLog
+import com.vibetun.app.data.AppTab
 import com.vibetun.app.data.ConnectionState
 import com.vibetun.app.data.VibeTunStore
 import com.vibetun.app.data.ProxyProfile
@@ -47,6 +48,7 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface as JavaNetworkInterface
+import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
@@ -342,6 +344,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     private var watchdogFailures = 0
     private var awgDeadChecks = 0
     private var probingTunnel = false
+    private var deadTunnelReconnectAttempts = 0
 
     private val tunnelWatchdog = object : Runnable {
         override fun run() {
@@ -358,6 +361,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         watchdogProfile = profile
         watchdogFailures = 0
         awgDeadChecks = 0
+        deadTunnelReconnectAttempts = 0
         mainHandler.removeCallbacks(tunnelWatchdog)
         mainHandler.postDelayed(tunnelWatchdog, TUNNEL_WATCHDOG_INTERVAL_MS)
     }
@@ -383,7 +387,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
             awgDeadChecks++
             AppLog.e(TAG, "dead-tunnel: handshake ${ageSec}с назад (проверка $awgDeadChecks/2)")
             if (awgDeadChecks >= 2) {
-                deadTunnel("Сервер перестал отвечать: последнее подтверждение туннеля было несколько минут назад. Подключение прервано — попробуйте снова.")
+                deadTunnel("Сервер перестал отвечать: последнее подтверждение туннеля было несколько минут назад.")
             }
         } else {
             if (awgDeadChecks > 0) AppLog.i(TAG, "dead-tunnel: handshake обновлён, счётчик сброшен")
@@ -391,18 +395,38 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         }
     }
 
-    /** sing-box-живость: HTTP-проба через сам туннель (процесс приложения в свой sing-box
-     *  TUN не исключён — запрос идёт через прокси). N подряд неудачных проб = туннель мёртв. */
+    /** sing-box-живость: HTTP-проба через сам туннель. UID VPN-приложения системой из
+     *  собственного VPN исключается (в логе sing-box ноль соединений от нашего пакета), поэтому
+     *  обычный HttpURLConnection шёл по ПРЯМОМУ каналу: оператор резал точку пробе, и живой
+     *  туннель ложно признавался мёртвым каждые ~90 с. Привязываем сокет к VPN-сети
+     *  (Network.bindSocket) — пакеты идут в TUN и дальше через прокси: это честная проверка
+     *  всей цепочки. N подряд неудачных проб = туннель мёртв. */
     private fun probeSingBoxTunnel() {
         if (probingTunnel) return
+        val network = findVpnNetwork()
+        if (network == null) {
+            AppLog.i(TAG, "dead-tunnel: VPN-сеть не найдена — проба пропущена (счётчик не меняем)")
+            return
+        }
         probingTunnel = true
         Thread({
             val ok = runCatching {
-                val conn = java.net.URL(TUNNEL_PROBE_URL).openConnection() as java.net.HttpURLConnection
-                conn.connectTimeout = TUNNEL_PROBE_TIMEOUT_MS
-                conn.readTimeout = TUNNEL_PROBE_TIMEOUT_MS
-                conn.instanceFollowRedirects = false
-                conn.responseCode == 204
+                val target = InetAddress.getByName(TUNNEL_PROBE_HOST)
+                val socket = Socket()
+                try {
+                    network.bindSocket(socket)
+                    socket.connect(InetSocketAddress(target, 80), TUNNEL_PROBE_TIMEOUT_MS)
+                    socket.soTimeout = TUNNEL_PROBE_TIMEOUT_MS
+                    val out = socket.getOutputStream()
+                    out.write(
+                        "GET /generate_204 HTTP/1.1\r\nHost: $TUNNEL_PROBE_HOST\r\nConnection: close\r\n\r\n"
+                            .toByteArray(Charsets.US_ASCII),
+                    )
+                    out.flush()
+                    socket.getInputStream().bufferedReader().readLine().orEmpty().contains(" 204")
+                } finally {
+                    runCatching { socket.close() }
+                }
             }.getOrDefault(false)
             mainHandler.post {
                 probingTunnel = false
@@ -414,17 +438,28 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
                     watchdogFailures++
                     AppLog.e(TAG, "dead-tunnel: проба через туннель не прошла ($watchdogFailures/$TUNNEL_WATCHDOG_FAILURE_LIMIT)")
                     if (watchdogFailures >= TUNNEL_WATCHDOG_FAILURE_LIMIT) {
-                        deadTunnel("Прокси-сервер не отвечает: туннель есть, но трафик через него не проходит. Подключение прервано — попробуйте снова.")
+                        deadTunnel("Прокси-сервер не отвечает: туннель есть, но трафик через него не проходит.")
                     }
                 }
             }
         }, "VibeTun-TunnelProbe").apply { isDaemon = true }.start()
     }
 
-    /** Мёртвый туннель: пишем ERROR (finishStop его не перезапишет — пишет STOPPED только
-     *  из STOPPING), закрываем ядро и гасим процесс. proxyWasActive НЕ сбрасываем: при
-     *  следующем запуске приложения попробуем подняться снова (fail() на старте сам
-     *  сбросит, если сервер по-прежнему недоступен). */
+    /** VPN-сеть, созданная этой службой (TRANSPORT_VPN без NOT_VPN). К ней и привязываем сокет пробы. */
+    private fun findVpnNetwork(): Network? = runCatching {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return null
+        cm.allNetworks.firstOrNull { network ->
+            val caps = cm.getNetworkCapabilities(network) ?: return@firstOrNull false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        }
+    }.getOrNull()
+
+    /** Мёртвый туннель: закрываем ядро и ВМЕСТО тупого ERROR пытаемся переподключиться
+     *  сами (до [DEAD_RECONNECT_MAX] попыток с нарастающей паузой). Успешный старт сбрасывает
+     *  счётчик (armTunnelWatchdog). Попытки кончились — ERROR уже с финальным текстом и
+     *  процесс гасим как раньше. proxyWasActive НЕ сбрасываем: при следующем запуске
+     *  приложения попробуем подняться снова. */
     private fun deadTunnel(reason: String) {
         AppLog.e(TAG, "dead-tunnel: $reason")
         if (!stopping.compareAndSet(false, true)) return
@@ -432,8 +467,31 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         stateStore.update(ConnectionState.ERROR, reason)
         teardownInBackground("dead-tunnel") { closed ->
             AppLog.i(TAG, "dead-tunnel: ядро закрыто (успешно=$closed)")
-            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-            scheduleProcessKill("dead-tunnel")
+            if (closed && deadTunnelReconnectAttempts < DEAD_RECONNECT_MAX) {
+                deadTunnelReconnectAttempts++
+                val delayMs = DEAD_RECONNECT_BASE_DELAY_MS * deadTunnelReconnectAttempts
+                AppLog.i(TAG, "dead-tunnel: автопереподключение ${deadTunnelReconnectAttempts}/$DEAD_RECONNECT_MAX через ${delayMs}мс")
+                stateStore.update(
+                    ConnectionState.STARTING,
+                    "Сервер перестал отвечать. Переподключение (${deadTunnelReconnectAttempts}/$DEAD_RECONNECT_MAX)…",
+                )
+                stopping.set(false)
+                mainHandler.postDelayed({
+                    // Пользователь мог нажать «Отключить» во время паузы — тогда состояние
+                    // уже STOPPING и поднимать VPN самим нельзя.
+                    if (stopping.get() || stateStore.state != ConnectionState.STARTING) {
+                        AppLog.i(TAG, "dead-tunnel: автопереподключение отменено (пришла остановка)")
+                        return@postDelayed
+                    }
+                    lastStoppedAtMs = SystemClock.elapsedRealtime()
+                    scheduleStart()
+                    armStartWatchdog()
+                }, delayMs)
+            } else {
+                stateStore.update(ConnectionState.ERROR, "$reason Подключение прервано — попробуйте снова.")
+                runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+                scheduleProcessKill("dead-tunnel")
+            }
         }
     }
 
@@ -1285,10 +1343,14 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     }
 
     private fun buildNotification(profileId: String? = requestedProfileId, contentText: String? = null): Notification {
+        // Тап по уведомлению всегда открывает страницу подключения (Профили), а не ту вкладку,
+        // где пользователь остался в прошлый раз (иначе из шторки попадаешь в Настройки).
         val openApp = PendingIntent.getActivity(
             this,
             0,
-            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                .putExtra(MainActivity.EXTRA_OPEN_TAB, AppTab.Profiles.name),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         // Не используем loadSelectedProfile(): он сбрасывает requestedProfileId.
@@ -1344,13 +1406,19 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         /** Подряд неудачных HTTP-проб через sing-box-туннель до признания его мёртвым. */
         private const val TUNNEL_WATCHDOG_FAILURE_LIMIT = 3
 
-        /** HTTP-проба: лёгкий эндпоинт, ожидаем ровно 204. */
-        private const val TUNNEL_PROBE_URL = "http://cp.cloudflare.com/generate_204"
+        /** HTTP-проба: лёгкий эндпоинт Cloudflare, ожидаем ровно 204. Имя хоста отдельно —
+         *  IP резолвится напрямую (системный DNS приложения), а сам сокет привязан к VPN-сети. */
+        private const val TUNNEL_PROBE_HOST = "cp.cloudflare.com"
         private const val TUNNEL_PROBE_TIMEOUT_MS = 10_000
 
         /** Возраст последнего AWG-handshake, после которого туннель считаем пропавшим
          *  (при живом сервере rekey происходит каждые ~2 мин). */
         private const val AWG_DEAD_AFTER_SEC = 180L
+
+        /** Автопереподключение при мёртвом туннеле: число попыток и базовая пауза
+         *  (n-я попытка ждёт BASE * n миллисекунд). */
+        private const val DEAD_RECONNECT_MAX = 3
+        private const val DEAD_RECONNECT_BASE_DELAY_MS = 3_000L
 
         /** Сколько ждём закрытия ядра, прежде чем закрыть его смертью процесса. */
         private const val STOP_TIMEOUT_MS = 4_000L

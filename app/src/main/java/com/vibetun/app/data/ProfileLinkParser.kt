@@ -184,7 +184,21 @@ object ProfileLinkParser {
                 (parsed?.host.orEmpty()) to (parsed?.port?.takeIf { p -> p > 0 } ?: 0)
             }
             ?: ("" to 0)
-        return profile(if (amnezia) "AmneziaWG" else "WireGuard", "amneziawg", host, port, raw)
+        // Человекочитаемое имя из WG-конфигов: первая строка-комментарий «# Имя конфига»
+        // (так их подписывает 3x-ui и AmneziaWG). Нет комментария — как раньше.
+        // Комментарии вида «# PublicKey = …» (AmneziaWG так комментирует поля) именем не считаем.
+        val wgFieldComment = Regex(
+            "(?i)^#?\\s*(?:Address|ListenPort|PrivateKey|PublicKey|PreSharedKey|Endpoint|AllowedIPs|DNS|MTU|" +
+                "Jc|Jmin|Jmax|S1|S2|S3|S4|H1|H2|H3|H4|I1|I2|I3|I4|I5)\\s*=",
+        )
+        val commentName = raw.lineSequence()
+            .map { it.trim() }
+            .filter { it.startsWith("#") && !wgFieldComment.containsMatchIn(it) }
+            .firstOrNull()
+            ?.removePrefix("#")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+        return profile(commentName ?: if (amnezia) "AmneziaWG" else "WireGuard", "amneziawg", host, port, raw)
     }
 
     private fun parseAuthority(address: String): Pair<String, Int> {

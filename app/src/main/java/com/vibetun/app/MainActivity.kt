@@ -100,6 +100,7 @@ class MainActivity : ComponentActivity() {
         window.statusBarColor = android.graphics.Color.rgb(25, 27, 29)
         window.navigationBarColor = android.graphics.Color.rgb(25, 27, 29)
         handleTileIntent(intent)
+        handleOpenTabIntent(intent)
         // Сторож закрытия: при смахивании приложения из недавних VPN выключится.
         runCatching { startService(Intent(this, com.vibetun.app.service.AppTaskWatcherService::class.java)) }
 
@@ -140,6 +141,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleTileIntent(intent)
+        handleOpenTabIntent(intent)
         if (intent.getBooleanExtra(EXTRA_CONNECT_FROM_TILE, false)) {
             connectFromTile()
             intent.removeExtra(EXTRA_CONNECT_FROM_TILE)
@@ -189,6 +191,14 @@ class MainActivity : ComponentActivity() {
         if (intent?.action == "android.service.quicksettings.action.QS_TILE_PREFERENCES") {
             viewModel.currentTab = com.vibetun.app.data.AppTab.Settings
         }
+    }
+
+    /** Тап по уведомлению/плитке открывает страницу подключения, даже если Activity живая
+     *  и осталась на другой вкладке. */
+    private fun handleOpenTabIntent(intent: Intent?) {
+        val tabName = intent?.getStringExtra(EXTRA_OPEN_TAB) ?: return
+        intent.removeExtra(EXTRA_OPEN_TAB)
+        viewModel.currentTab = com.vibetun.app.data.AppTab.valueOf(tabName)
     }
 
     private fun toggleProxy() {
@@ -333,6 +343,7 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_CONNECT_FROM_TILE = "connect_from_qs_tile"
+        const val EXTRA_OPEN_TAB = "open_tab"
         private const val START_TIMEOUT_MS = 60_000L
     }
 }
