@@ -83,6 +83,26 @@ jobs:
             tail -n 35 "$RUNNER_TEMP/gradle.log" | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
           fi
+      - name: Sign APK with release keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # Свой keystore: debug-keystore раннера генерируется заново на каждый прогон,
+          # подпись менялась между сборками и обновление поверх не устанавливалось
+          # («конфликтует с другим пакетом»). Переподписываем готовый APK своим ключом.
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/vibetun.keystore"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+            --ks "$RUNNER_TEMP/vibetun.keystore" \
+            --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --key-pass "pass:$ANDROID_KEY_PASSWORD" \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs \
+            app/build/outputs/apk/debug/app-debug.apk | grep -i "certificate SHA-256" || true
       - uses: actions/upload-artifact@v4
         with:
           name: VibeTun-debug-apk

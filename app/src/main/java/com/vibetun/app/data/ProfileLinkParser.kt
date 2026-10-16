@@ -173,7 +173,18 @@ object ProfileLinkParser {
         // (без Jc/Jmin/... в UAPI уходит стандартный WG-handshake), а sing-box-путь
         // для WG-INI не поддержан — протокол «wireguard» уходил бы в чужую службу и ломался.
         // Так 3x-ui-подписки с vpn:// (обычный WG-конфиг) подключаются через AWG-ядро.
-        return profile(if (amnezia) "AmneziaWG" else "WireGuard", "amneziawg", "", 0, raw)
+        // Endpoint из INI кладём в server/port — иначе в списке профилей вместо адреса
+        // сервера показывалась заглушка «Конфигурация WireGuard» и ключи не отличить.
+        val endpointRaw = Regex("(?im)^\\s*Endpoint\\s*=\\s*([^\\s#;]+)").find(raw)?.groupValues?.get(1)
+        val (host, port) = endpointRaw
+            ?.let { ep ->
+                // "host:port" или "[v6]:port"
+                val cleaned = if (ep.startsWith("[")) ep.substringBefore("]").removePrefix("[") else ep
+                val parsed = runCatching { URI("https://$cleaned") }.getOrNull()
+                (parsed?.host.orEmpty()) to (parsed?.port?.takeIf { p -> p > 0 } ?: 0)
+            }
+            ?: ("" to 0)
+        return profile(if (amnezia) "AmneziaWG" else "WireGuard", "amneziawg", host, port, raw)
     }
 
     private fun parseAuthority(address: String): Pair<String, Int> {

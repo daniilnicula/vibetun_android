@@ -20,9 +20,16 @@ data class ProxyProfile(
             server.isNotBlank() && port > 0 -> "$server:$port"
             server.isNotBlank() -> server
             protocol.equals("tunnel", ignoreCase = true) -> "Локальный JSON-конфиг"
-            protocol.equals("wireguard", ignoreCase = true) || protocol.equals("amneziawg", ignoreCase = true) -> "Конфигурация WireGuard"
+            protocol.equals("wireguard", ignoreCase = true) || protocol.equals("amneziawg", ignoreCase = true) ->
+                wireGuardEndpointFromSource() ?: "Конфигурация WireGuard"
             else -> "Сервер не указан"
         }
+
+    /** Endpoint = host:port прямо из WG/AWG-INI — чтобы в списке ключи можно было
+     *  отличить по серверу, даже если профиль импортирован до того, как парсер
+     *  стал раскладывать Endpoint в server/port. */
+    private fun wireGuardEndpointFromSource(): String? =
+        Regex("(?im)^\\s*Endpoint\\s*=\\s*([^\\s#;]+)").find(source)?.groupValues?.get(1)
 }
 
 data class ProfileParseResult(
