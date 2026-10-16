@@ -735,7 +735,6 @@ private fun RoutingPage(
                             modifier = Modifier.padding(top = 3.dp),
                         )
                     }
-                    StatusTag(text = "ROUTE", tone = p.accent)
                 }
                 Text(
                     "Домен (yandex.ru — с поддоменами), IP/CIDR (1.2.3.0/24) или ключевое слово (youtube — regex-вхождение). DIRECT уходит мимо прокси.",
@@ -885,7 +884,6 @@ private fun RoutingPage(
                         Text("Приложения в туннеле", color = p.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                         Text("PROXY: ${viewModel.selectedPackages.size} · DIRECT: ${viewModel.directPackages.size}", color = p.textMuted, fontSize = 10.sp, modifier = Modifier.padding(top = 3.dp))
                     }
-                    StatusTag(text = "PER-APP", tone = p.accent)
                 }
                 Text(
                     "Отметка у приложения важнее маршрута по умолчанию: PROXY — приложение через VPN, DIRECT — мимо туннеля.",
@@ -1098,16 +1096,16 @@ private fun SettingsPage(
                     modifier = Modifier.padding(top = 7.dp),
                 )
                 Spacer(Modifier.height(13.dp))
-                Text("ПРОФИЛИ WINDOWS", color = p.textMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.9.sp)
+                Text("ПОДДЕРЖИВАЕМЫЕ ПРОТОКОЛЫ", color = p.textMuted, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.9.sp)
                 Text(
-                    "VLESS · VMess · Trojan · Shadowsocks · SOCKS · HTTP/HTTPS · Hysteria · Hysteria 2 · TUIC · WireGuard · SSH · sing-box JSON", 
+                    "VLESS · VMess · Trojan · Shadowsocks · SOCKS · HTTP/HTTPS · Hysteria · Hysteria 2 · TUIC · WireGuard / AmneziaWG · sing-box JSON",
                     color = p.textSecondary,
                     fontSize = 10.sp,
                     lineHeight = 15.sp,
                     modifier = Modifier.padding(top = 5.dp),
                 )
                 Text(
-                    "AmneziaWG, AnyTLS, SSR и MTProto можно импортировать, но это ядро их не подключает.", 
+                    "SSH, SSR, AnyTLS и MTProto можно импортировать, но это ядро их не подключает.",
                     color = p.textMuted,
                     fontSize = 9.sp,
                     modifier = Modifier.padding(top = 4.dp),

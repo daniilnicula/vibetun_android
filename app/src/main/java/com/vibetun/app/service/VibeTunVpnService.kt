@@ -93,6 +93,70 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        registerNetworkChangeMonitor()
+    }
+
+    // ==================== автопереподключение при смене сети ====================
+
+    /** Колбэк смены default-сети. Отдельный от мониторов libbox (interfaceCallbacks):
+     *  тот информирует ядро об интерфейсе для НОВЫХ соединений, этот решает, когда
+     *  живой туннель пора пересоздать — QUIC-сессии и AWG-сокет к старому интерфейсу
+     *  не переезжают сами (в логах: ENETUNREACH / tx>0, rx=0 до ручного рестарта). */
+    private var networkChangeCallback: ConnectivityManager.NetworkCallback? = null
+    private var pendingNetworkReconnect: Runnable? = null
+
+    @Volatile private var lastRealNetworkName: String = ""
+
+    private fun registerNetworkChangeMonitor() {
+        if (networkChangeCallback != null) return
+        // Базовая линия ДО регистрации: иначе первый onAvailable с текущей сетью
+        // посчитается сменой и спровоцирует лишний рестарт при поднятии службы.
+        lastRealNetworkName = connectivity.activeNetwork?.let(::interfaceNameOfNetwork).orEmpty()
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = considerNetworkChange(network)
+            override fun onLinkPropertiesChanged(network: Network, props: android.net.LinkProperties) =
+                considerNetworkChange(network)
+        }
+        networkChangeCallback = callback
+        runCatching { connectivity.registerDefaultNetworkCallback(callback) }
+    }
+
+    private fun unregisterNetworkChangeMonitor() {
+        networkChangeCallback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
+        networkChangeCallback = null
+        pendingNetworkReconnect?.let { mainHandler.removeCallbacks(it) }
+        pendingNetworkReconnect = null
+    }
+
+    private fun interfaceNameOfNetwork(network: Network): String? {
+        val caps = connectivity.getNetworkCapabilities(network) ?: return null
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return null
+        return connectivity.getLinkProperties(network)?.interfaceName?.takeIf { it.isNotBlank() }
+    }
+
+    private fun considerNetworkChange(network: Network) {
+        val name = interfaceNameOfNetwork(network) ?: return
+        val previous = lastRealNetworkName
+        if (name == previous) return
+        lastRealNetworkName = name
+        if (previous.isBlank()) return // первое известное имя — не смена сети
+        if (!isProxyActive() || stopping.get()) return
+        AppLog.i(TAG, "Смена сети: $previous -> $name — переподключение через ${NETWORK_RECONNECT_DELAY_MS}мс")
+        scheduleNetworkReconnect(previous, name)
+    }
+
+    /** Дебаунс: Wi-Fi ↔ LTE может дребезжать несколько секунд — склеиваем всплески
+     *  в один перезапуск. Пока ядро не поднялось или идёт остановка — не дёргаемся. */
+    private fun scheduleNetworkReconnect(from: String, to: String) {
+        pendingNetworkReconnect?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            pendingNetworkReconnect = null
+            if (stopping.get()) return@Runnable
+            if (!isProxyActive()) return@Runnable
+            reconnectAfterNetworkChange(from, to)
+        }
+        pendingNetworkReconnect = runnable
+        mainHandler.postDelayed(runnable, NETWORK_RECONNECT_DELAY_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -271,16 +335,25 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
      * секундами — на главном потоке это ANR и потерянный START), саму службу НЕ гасим и процесс
      * НЕ убиваем: следом идёт старт с новым профилем.
      */
-    private fun restartWithSelectedProfile() {
+    private fun restartWithSelectedProfile() = restartCore("Смена профиля…", "смена профиля")
+
+    /** Переподключение после смены default-сети (Wi-Fi ↔ LTE и т.п.). Транспортный сокет
+     *  старого туннеля прибит к исчезнувшему интерфейсу: без рестарта ядро пишет в никуда
+     *  (hysteria2/tuic — «network is unreachable», AmneziaWG — tx>0, rx=0), а статус
+     *  остаётся RUNNING. Делаем то, что делают v2rayNG/NekoBox/AmneziaWG: перезапуск ядра. */
+    private fun reconnectAfterNetworkChange(from: String, to: String) =
+        restartCore("Переподключение: смена сети ($from → $to)…", "смена сети $from → $to")
+
+    private fun restartCore(statusText: String, reason: String) {
         cancelPendingWork()
-        stateStore.update(ConnectionState.STARTING, "Смена профиля…")
+        stateStore.update(ConnectionState.STARTING, statusText)
         Thread({
             val startedAt = SystemClock.elapsedRealtime()
             val closed = closeNativeServiceBlocking(STOP_TIMEOUT_MS)
-            AppLog.i(TAG, "смена профиля: ядро закрыто (успешно=$closed) за ${SystemClock.elapsedRealtime() - startedAt}мс")
+            AppLog.i(TAG, "$reason: ядро закрыто (успешно=$closed) за ${SystemClock.elapsedRealtime() - startedAt}мс")
             mainHandler.post {
                 if (stopping.get()) {
-                    AppLog.i(TAG, "смена профиля отменена: пришла команда остановки")
+                    AppLog.i(TAG, "$reason отменена: пришла команда остановки")
                     return@post
                 }
                 lastStoppedAtMs = SystemClock.elapsedRealtime()
@@ -1069,6 +1142,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         AppLog.i(TAG, "onDestroy: начало (ядро активно=${isProxyActive()}, остановка=${stopping.get()})")
         if (instance === this) instance = null
         cancelPendingWork()
+        unregisterNetworkChangeMonitor()
         lastStoppedAtMs = SystemClock.elapsedRealtime()
         interfaceCallbacks.values.toList().forEach { callback ->
             runCatching { connectivity.unregisterNetworkCallback(callback) }
@@ -1152,6 +1226,9 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         private const val NO_AMNEZIA_HANDLE = -1
         private const val SETTLE_DELAY_MS = 2500L
         private const val AWG_HANDSHAKE_TIMEOUT_MS = 30_000L
+
+        /** Дебаунс автопереподключения при смене default-сети (Wi-Fi ↔ LTE). */
+        private const val NETWORK_RECONNECT_DELAY_MS = 3500L
 
         /** Сколько ждём закрытия ядра, прежде чем закрыть его смертью процесса. */
         private const val STOP_TIMEOUT_MS = 4_000L
