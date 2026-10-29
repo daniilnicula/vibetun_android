@@ -2,6 +2,7 @@ package v2rayhttp
 
 import (
 	std_bufio "bufio"
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/buf"
@@ -29,6 +31,9 @@ type HTTPConn struct {
 }
 
 func NewHTTP1Conn(conn net.Conn, request *http.Request) *HTTPConn {
+	if request.Header.Get("Host") == "" {
+		request.Header.Set("Host", request.Host)
+	}
 	return &HTTPConn{
 		Conn:    conn,
 		request: request,
@@ -87,9 +92,6 @@ func (c *HTTPConn) writeRequest(payload []byte) error {
 	if err != nil {
 		return err
 	}
-	if c.request.Header.Get("Host") == "" {
-		c.request.Header.Set("Host", c.request.Host)
-	}
 	for key, value := range c.request.Header {
 		_, err = writer.Write([]byte(F.ToString(key, ": ", strings.Join(value, ", "), CRLF)))
 		if err != nil {
@@ -128,10 +130,12 @@ func (c *HTTPConn) Upstream() any {
 }
 
 type HTTP2Conn struct {
-	reader io.Reader
-	writer io.Writer
-	create chan struct{}
-	err    error
+	reader  io.Reader
+	writer  io.Writer
+	create  chan struct{}
+	err     error
+	cancel  context.CancelFunc
+	onClose func()
 }
 
 func NewHTTPConn(reader io.Reader, writer io.Writer) HTTP2Conn {
@@ -141,10 +145,11 @@ func NewHTTPConn(reader io.Reader, writer io.Writer) HTTP2Conn {
 	}
 }
 
-func NewLateHTTPConn(writer io.Writer) *HTTP2Conn {
+func NewLateHTTPConn(writer io.Writer, cancel context.CancelFunc) *HTTP2Conn {
 	return &HTTP2Conn{
 		create: make(chan struct{}),
 		writer: writer,
+		cancel: cancel,
 	}
 }
 
@@ -155,10 +160,10 @@ func (c *HTTP2Conn) Setup(reader io.Reader, err error) {
 }
 
 func (c *HTTP2Conn) Read(b []byte) (n int, err error) {
-	if c.reader == nil {
+	if c.create != nil {
 		<-c.create
 		if c.err != nil {
-			return 0, c.err
+			return 0, baderror.WrapH2(c.err)
 		}
 	}
 	n, err = c.reader.Read(b)
@@ -171,7 +176,24 @@ func (c *HTTP2Conn) Write(b []byte) (n int, err error) {
 }
 
 func (c *HTTP2Conn) Close() error {
-	return common.Close(c.reader, c.writer)
+	var reader io.Reader
+	if c.create != nil {
+		select {
+		case <-c.create:
+			reader = c.reader
+		default:
+		}
+	} else {
+		reader = c.reader
+	}
+	err := common.Close(reader, c.writer)
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return err
 }
 
 func (c *HTTP2Conn) LocalAddr() net.Addr {
@@ -254,4 +276,12 @@ func (w *HTTP2ConnWrapper) Close() error {
 
 func (w *HTTP2ConnWrapper) Upstream() any {
 	return w.ExtendedConn
+}
+
+func DupContext(ctx context.Context) context.Context {
+	id, loaded := log.IDFromContext(ctx)
+	if !loaded {
+		return context.Background()
+	}
+	return log.ContextWithID(context.Background(), id)
 }

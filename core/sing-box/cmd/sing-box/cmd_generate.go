@@ -1,4 +1,4 @@
-package boxmain
+package main
 
 import (
 	"crypto/rand"

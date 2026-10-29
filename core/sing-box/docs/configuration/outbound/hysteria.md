@@ -1,3 +1,12 @@
+---
+icon: material/new-box
+---
+
+!!! quote "Changes in sing-box 1.12.0"
+
+    :material-plus: [server_ports](#server_ports)  
+    :material-plus: [hop_interval](#hop_interval)
+
 ### Structure
 
 ```json
@@ -7,6 +16,10 @@
   
   "server": "127.0.0.1",
   "server_port": 1080,
+  "server_ports": [
+    "2080:3000"
+  ],
+  "hop_interval": "",
   "up": "100 Mbps",
   "up_mbps": 100,
   "down": "100 Mbps",
@@ -14,13 +27,18 @@
   "obfs": "fuck me till the daylight",
   "auth": "",
   "auth_str": "password",
+  "network": "",
+  "tls": {},
+
+  ... // QUIC Fields
+
+  ... // Dial Fields
+
+  // Deprecated
+
   "recv_window_conn": 0,
   "recv_window": 0,
-  "disable_mtu_discovery": false,
-  "network": "tcp",
-  "tls": {},
-  
-  ... // Dial Fields
+  "disable_mtu_discovery": false
 }
 ```
 
@@ -37,6 +55,22 @@ The server address.
 ==Required==
 
 The server port.
+
+#### server_ports
+
+!!! question "Since sing-box 1.12.0"
+
+Server port range list.
+
+Conflicts with `server_port`.
+
+#### hop_interval
+
+!!! question "Since sing-box 1.12.0"
+
+Port hopping interval.
+
+`30s` is used by default.
 
 #### up, down
 
@@ -75,24 +109,6 @@ Authentication password, in base64.
 
 Authentication password.
 
-#### recv_window_conn
-
-The QUIC stream-level flow control window for receiving data.
-
-`15728640 (15 MB/s)` will be used if empty.
-
-#### recv_window
-
-The QUIC connection-level flow control window for receiving data.
-
-`67108864 (64 MB/s)` will be used if empty.
-
-#### disable_mtu_discovery
-
-Disables Path MTU Discovery (RFC 8899). Packets will then be at most 1252 (IPv4) / 1232 (IPv6) bytes in size.
-
-Force enabled on for systems other than Linux and Windows (according to upstream).
-
 #### network
 
 Enabled network
@@ -107,6 +123,30 @@ Both is enabled by default.
 
 TLS configuration, see [TLS](/configuration/shared/tls/#outbound).
 
+### QUIC Fields
+
+See [QUIC Fields](/configuration/shared/quic/) for details.
+
 ### Dial Fields
 
 See [Dial Fields](/configuration/shared/dial/) for details.
+
+### Deprecated Fields
+
+#### recv_window_conn
+
+!!! failure "Deprecated in sing-box 1.14.0"
+
+    Use QUIC fields `stream_receive_window` instead.
+
+#### recv_window
+
+!!! failure "Deprecated in sing-box 1.14.0"
+
+    Use QUIC fields `connection_receive_window` instead.
+
+#### disable_mtu_discovery
+
+!!! failure "Deprecated in sing-box 1.14.0"
+
+    Use QUIC fields `disable_path_mtu_discovery` instead.

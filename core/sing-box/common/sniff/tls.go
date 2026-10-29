@@ -3,14 +3,17 @@ package sniff
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common/bufio"
+	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 )
 
-func TLSClientHello(ctx context.Context, reader io.Reader) (*adapter.InboundContext, error) {
+func TLSClientHello(ctx context.Context, metadata *adapter.InboundContext, reader io.Reader) error {
 	var clientHello *tls.ClientHelloInfo
 	err := tls.Server(bufio.NewReadOnlyConn(reader), &tls.Config{
 		GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -19,7 +22,13 @@ func TLSClientHello(ctx context.Context, reader io.Reader) (*adapter.InboundCont
 		},
 	}).HandshakeContext(ctx)
 	if clientHello != nil {
-		return &adapter.InboundContext{Protocol: C.ProtocolTLS, Domain: clientHello.ServerName}, nil
+		metadata.Protocol = C.ProtocolTLS
+		metadata.Domain = M.ParseSocksaddrHostPort(clientHello.ServerName, 0).Fqdn
+		return nil
 	}
-	return nil, err
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return E.Cause1(ErrNeedMoreData, err)
+	} else {
+		return err
+	}
 }

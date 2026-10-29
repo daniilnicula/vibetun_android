@@ -1,4 +1,4 @@
-package boxmain
+package main
 
 import (
 	"io"
@@ -61,16 +61,17 @@ func geoipExport(countryCode string) error {
 		outputFile   *os.File
 		outputWriter io.Writer
 	)
-	if flagGeoipExportOutput == "stdout" {
+	switch flagGeoipExportOutput {
+	case "stdout":
 		outputWriter = os.Stdout
-	} else if flagGeoipExportOutput == flagGeoipExportDefaultOutput {
+	case flagGeoipExportDefaultOutput:
 		outputFile, err = os.Create("geoip-" + countryCode + ".json")
 		if err != nil {
 			return err
 		}
 		defer outputFile.Close()
 		outputWriter = outputFile
-	} else {
+	default:
 		outputFile, err = os.Create(flagGeoipExportOutput)
 		if err != nil {
 			return err
@@ -87,7 +88,7 @@ func geoipExport(countryCode string) error {
 		headlessRule.IPCIDR = append(headlessRule.IPCIDR, cidr.String())
 	}
 	var plainRuleSet option.PlainRuleSetCompat
-	plainRuleSet.Version = C.RuleSetVersion1
+	plainRuleSet.Version = C.RuleSetVersion2
 	plainRuleSet.Options.Rules = []option.HeadlessRule{
 		{
 			Type:           C.RuleTypeDefault,

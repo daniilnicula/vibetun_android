@@ -1,15 +1,18 @@
 package libbox
 
 import (
-	"net"
 	"net/netip"
-	"sync"
+	"slices"
 
-	"github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/service/powerreport"
+	tun "github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-tun/dnsinfo"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
-	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/x/list"
 )
 
@@ -20,60 +23,45 @@ var (
 
 type platformDefaultInterfaceMonitor struct {
 	*platformInterfaceWrapper
-	networkAddresses      []networkAddress
-	defaultInterfaceName  string
-	defaultInterfaceIndex int
-	element               *list.Element[tun.NetworkUpdateCallback]
-	access                sync.Mutex
-	callbacks             list.List[tun.DefaultInterfaceUpdateCallback]
-	logger                logger.Logger
-}
-
-type networkAddress struct {
-	interfaceName  string
-	interfaceIndex int
-	addresses      []netip.Prefix
+	logger                      logger.Logger
+	callbacks                   list.List[tun.DefaultInterfaceUpdateCallback]
+	myInterfaces                []string
+	defaultInterfaceInitialized bool
+	defaultDNSServers           []string
+	dnsWatcher                  *dnsinfo.Watcher
+	lastNetworkPath             string
 }
 
 func (m *platformDefaultInterfaceMonitor) Start() error {
-	return m.iif.StartDefaultInterfaceMonitor(m)
+	if C.IsDarwin {
+		dnsWatcher, err := dnsinfo.NewWatcher(m.updateDNSServers, m.logger)
+		if err != nil {
+			return E.Cause(err, "watch DNS configuration")
+		}
+		m.dnsWatcher = dnsWatcher
+	}
+	err := m.iif.StartDefaultInterfaceMonitor(m)
+	if err != nil {
+		if C.IsDarwin {
+			m.dnsWatcher.Close()
+		}
+		return err
+	}
+	return nil
 }
 
 func (m *platformDefaultInterfaceMonitor) Close() error {
-	return m.iif.CloseDefaultInterfaceMonitor(m)
+	err := m.iif.CloseDefaultInterfaceMonitor(m)
+	if C.IsDarwin {
+		err = E.Errors(err, m.dnsWatcher.Close())
+	}
+	return err
 }
 
-func (m *platformDefaultInterfaceMonitor) DefaultInterfaceName(destination netip.Addr) string {
-	for _, address := range m.networkAddresses {
-		for _, prefix := range address.addresses {
-			if prefix.Contains(destination) {
-				return address.interfaceName
-			}
-		}
-	}
-	return m.defaultInterfaceName
-}
-
-func (m *platformDefaultInterfaceMonitor) DefaultInterfaceIndex(destination netip.Addr) int {
-	for _, address := range m.networkAddresses {
-		for _, prefix := range address.addresses {
-			if prefix.Contains(destination) {
-				return address.interfaceIndex
-			}
-		}
-	}
-	return m.defaultInterfaceIndex
-}
-
-func (m *platformDefaultInterfaceMonitor) DefaultInterface(destination netip.Addr) (string, int) {
-	for _, address := range m.networkAddresses {
-		for _, prefix := range address.addresses {
-			if prefix.Contains(destination) {
-				return address.interfaceName, address.interfaceIndex
-			}
-		}
-	}
-	return m.defaultInterfaceName, m.defaultInterfaceIndex
+func (m *platformDefaultInterfaceMonitor) DefaultInterface() *control.Interface {
+	m.defaultInterfaceAccess.Lock()
+	defer m.defaultInterfaceAccess.Unlock()
+	return m.defaultInterface
 }
 
 func (m *platformDefaultInterfaceMonitor) OverrideAndroidVPN() bool {
@@ -85,96 +73,147 @@ func (m *platformDefaultInterfaceMonitor) AndroidVPNEnabled() bool {
 }
 
 func (m *platformDefaultInterfaceMonitor) RegisterCallback(callback tun.DefaultInterfaceUpdateCallback) *list.Element[tun.DefaultInterfaceUpdateCallback] {
-	m.access.Lock()
-	defer m.access.Unlock()
+	m.defaultInterfaceAccess.Lock()
+	defer m.defaultInterfaceAccess.Unlock()
 	return m.callbacks.PushBack(callback)
 }
 
 func (m *platformDefaultInterfaceMonitor) UnregisterCallback(element *list.Element[tun.DefaultInterfaceUpdateCallback]) {
-	m.access.Lock()
-	defer m.access.Unlock()
+	m.defaultInterfaceAccess.Lock()
+	defer m.defaultInterfaceAccess.Unlock()
 	m.callbacks.Remove(element)
 }
 
-func (m *platformDefaultInterfaceMonitor) UpdateDefaultInterface(interfaceName string, interfaceIndex32 int32) {
-	if interfaceName == "" || interfaceIndex32 == -1 {
-		m.defaultInterfaceName = ""
-		m.defaultInterfaceIndex = -1
-		m.access.Lock()
-		callbacks := m.callbacks.Array()
-		m.access.Unlock()
-		for _, callback := range callbacks {
-			callback(tun.EventNoRoute)
-		}
+func (m *platformDefaultInterfaceMonitor) UpdateNetworkPath(networkPath string) {
+	if networkPath != m.lastNetworkPath {
+		m.lastNetworkPath = networkPath
+		m.logger.Debug("updated network path: ", networkPath)
+	}
+	if m.powerManager == nil {
 		return
 	}
-	var err error
-	if m.iif.UsePlatformInterfaceGetter() {
-		err = m.updateInterfacesPlatform()
+	recorder := m.powerManager.Recorder()
+	if recorder == nil {
+		return
+	}
+	recorder.UpdateNetworkPath(networkPath)
+}
+
+func (m *platformDefaultInterfaceMonitor) UpdateDefaultInterface(interfaceName string, interfaceIndex32 int32, isExpensive bool, isConstrained bool) {
+	if sFixAndroidStack {
+		done := make(chan struct{})
+		go func() {
+			m.updateDefaultInterface(interfaceName, interfaceIndex32, isExpensive, isConstrained)
+			close(done)
+		}()
+		<-done
 	} else {
-		err = m.updateInterfaces()
+		m.updateDefaultInterface(interfaceName, interfaceIndex32, isExpensive, isConstrained)
 	}
-	if err == nil {
-		err = m.router.UpdateInterfaces()
+}
+
+func (m *platformDefaultInterfaceMonitor) updateDefaultInterface(interfaceName string, interfaceIndex32 int32, isExpensive bool, isConstrained bool) {
+	var recorder *powerreport.Recorder
+	if m.powerManager != nil {
+		recorder = m.powerManager.Recorder()
 	}
+	if recorder != nil {
+		networkType := interfaceName
+		if interfaceIndex32 == -1 {
+			networkType = "none"
+		} else {
+			if isExpensive {
+				networkType += ",expensive"
+			}
+			if isConstrained {
+				networkType += ",constrained"
+			}
+		}
+		recorder.UpdateNetworkType(networkType)
+	}
+	m.isExpensive = isExpensive
+	m.isConstrained = isConstrained
+	err := m.networkManager.UpdateInterfaces()
 	if err != nil {
 		m.logger.Error(E.Cause(err, "update interfaces"))
 	}
-	interfaceIndex := int(interfaceIndex32)
-	if m.defaultInterfaceName == interfaceName && m.defaultInterfaceIndex == interfaceIndex {
+	m.defaultInterfaceAccess.Lock()
+	if interfaceIndex32 == -1 {
+		m.defaultInterface = nil
+		m.defaultDNSServers = nil
+		m.defaultInterfaceInitialized = true
+		callbacks := m.callbacks.Array()
+		m.defaultInterfaceAccess.Unlock()
+		for _, callback := range callbacks {
+			callback(nil, 0)
+		}
 		return
 	}
-	m.defaultInterfaceName = interfaceName
-	m.defaultInterfaceIndex = interfaceIndex
-	m.access.Lock()
+	oldInterface := m.defaultInterface
+	newInterface, err := m.networkManager.InterfaceFinder().ByIndex(int(interfaceIndex32))
+	if err != nil {
+		m.defaultInterfaceAccess.Unlock()
+		m.logger.Error(E.Cause(err, "find updated interface: ", interfaceName))
+		return
+	}
+	oldDNSServers := m.defaultDNSServers
+	m.defaultInterface = newInterface
+	m.defaultDNSServers = m.readDNSServers(newInterface.Index)
+	if m.defaultInterfaceInitialized && oldInterface != nil && oldInterface.Name == m.defaultInterface.Name && oldInterface.Index == m.defaultInterface.Index && slices.Equal(oldDNSServers, m.defaultDNSServers) {
+		m.defaultInterfaceAccess.Unlock()
+		return
+	}
+	m.defaultInterfaceInitialized = true
 	callbacks := m.callbacks.Array()
-	m.access.Unlock()
+	m.defaultInterfaceAccess.Unlock()
 	for _, callback := range callbacks {
-		callback(tun.EventInterfaceUpdate)
+		callback(newInterface, 0)
 	}
 }
 
-func (m *platformDefaultInterfaceMonitor) updateInterfaces() error {
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return err
+func (m *platformDefaultInterfaceMonitor) updateDNSServers() {
+	m.defaultInterfaceAccess.Lock()
+	defaultInterface := m.defaultInterface
+	if defaultInterface == nil {
+		m.defaultInterfaceAccess.Unlock()
+		return
 	}
-	var addresses []networkAddress
-	for _, iif := range interfaces {
-		var netAddresses []net.Addr
-		netAddresses, err = iif.Addrs()
-		if err != nil {
-			return err
+	dnsServers := m.readDNSServers(defaultInterface.Index)
+	if slices.Equal(m.defaultDNSServers, dnsServers) {
+		m.defaultInterfaceAccess.Unlock()
+		return
+	}
+	m.defaultDNSServers = dnsServers
+	callbacks := m.callbacks.Array()
+	m.defaultInterfaceAccess.Unlock()
+	for _, callback := range callbacks {
+		callback(defaultInterface, 0)
+	}
+}
+
+func (m *platformDefaultInterfaceMonitor) readDNSServers(interfaceIndex int) []string {
+	if C.IsDarwin {
+		dnsConfiguration := dnsinfo.Copy()
+		if dnsConfiguration == nil {
+			return nil
 		}
-		var address networkAddress
-		address.interfaceName = iif.Name
-		address.interfaceIndex = iif.Index
-		address.addresses = common.Map(common.FilterIsInstance(netAddresses, func(it net.Addr) (*net.IPNet, bool) {
-			value, loaded := it.(*net.IPNet)
-			return value, loaded
-		}), func(it *net.IPNet) netip.Prefix {
-			bits, _ := it.Mask.Size()
-			return netip.PrefixFrom(M.AddrFromIP(it.IP), bits)
+		return common.Map(dnsConfiguration.Select(interfaceIndex).Servers, func(it netip.AddrPort) string {
+			return it.Addr().String()
 		})
-		addresses = append(addresses, address)
 	}
-	m.networkAddresses = addresses
-	return nil
+	return common.Find(m.networkManager.NetworkInterfaces(), func(it adapter.NetworkInterface) bool {
+		return it.Index == interfaceIndex
+	}).DNSServers
 }
 
-func (m *platformDefaultInterfaceMonitor) updateInterfacesPlatform() error {
-	interfaces, err := m.Interfaces()
-	if err != nil {
-		return err
-	}
-	var addresses []networkAddress
-	for _, iif := range interfaces {
-		var address networkAddress
-		address.interfaceName = iif.Name
-		address.interfaceIndex = iif.Index
-		// address.addresses = common.Map(iif.Addresses, netip.MustParsePrefix)
-		addresses = append(addresses, address)
-	}
-	m.networkAddresses = addresses
-	return nil
+func (m *platformDefaultInterfaceMonitor) RegisterMyInterface(interfaceName string) {
+	m.defaultInterfaceAccess.Lock()
+	defer m.defaultInterfaceAccess.Unlock()
+	m.myInterfaces = append(m.myInterfaces, interfaceName)
+}
+
+func (m *platformDefaultInterfaceMonitor) MyInterfaces() []string {
+	m.defaultInterfaceAccess.Lock()
+	defer m.defaultInterfaceAccess.Unlock()
+	return m.myInterfaces
 }

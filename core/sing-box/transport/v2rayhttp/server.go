@@ -11,24 +11,27 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
 	sHttp "github.com/sagernet/sing/protocol/http"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck
 )
 
 var _ adapter.V2RayServerTransport = (*Server)(nil)
 
 type Server struct {
 	ctx        context.Context
+	logger     logger.ContextLogger
 	tlsConfig  tls.ServerConfig
 	handler    adapter.V2RayServerTransportHandler
 	httpServer *http.Server
@@ -40,10 +43,11 @@ type Server struct {
 	headers    http.Header
 }
 
-func NewServer(ctx context.Context, options option.V2RayHTTPOptions, tlsConfig tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (*Server, error) {
+func NewServer(ctx context.Context, logger logger.ContextLogger, options option.V2RayHTTPOptions, tlsConfig tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (*Server, error) {
 	server := &Server{
 		ctx:       ctx,
 		tlsConfig: tlsConfig,
+		logger:    logger,
 		handler:   handler,
 		h2Server: &http2.Server{
 			IdleTimeout: time.Duration(options.IdleTimeout),
@@ -63,7 +67,11 @@ func NewServer(ctx context.Context, options option.V2RayHTTPOptions, tlsConfig t
 		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return log.ContextWithNewID(ctx)
+		},
 	}
+	//nolint:staticcheck
 	server.h2cHandler = h2c.NewHandler(server, server.h2Server)
 	return server, nil
 }
@@ -95,14 +103,18 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 	}
 
-	var metadata M.Metadata
-	metadata.Source = sHttp.SourceAddress(request)
+	source := sHttp.SourceAddress(request)
 	if h, ok := writer.(http.Hijacker); ok {
+		if request.ContentLength > buf.MaxPooledBufferSize {
+			s.invalidRequest(writer, request, http.StatusRequestEntityTooLarge, E.New("request body too large: ", request.ContentLength))
+			return
+		}
 		var requestBody *buf.Buffer
 		if contentLength := int(request.ContentLength); contentLength > 0 {
 			requestBody = buf.NewSize(contentLength)
 			_, err := requestBody.ReadFullFrom(request.Body, contentLength)
 			if err != nil {
+				requestBody.Release()
 				s.invalidRequest(writer, request, 0, E.Cause(err, "read request"))
 				return
 			}
@@ -111,6 +123,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		writer.(http.Flusher).Flush()
 		conn, reader, err := h.Hijack()
 		if err != nil {
+			requestBody.Release()
 			s.invalidRequest(writer, request, 0, E.Cause(err, "hijack conn"))
 			return
 		}
@@ -118,6 +131,8 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			cache := buf.NewSize(cacheLen)
 			_, err = cache.ReadFullFrom(reader.Reader, cacheLen)
 			if err != nil {
+				cache.Release()
+				requestBody.Release()
 				conn.Close()
 				s.invalidRequest(writer, request, 0, E.Cause(err, "read cache"))
 				return
@@ -127,14 +142,20 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		if requestBody != nil {
 			conn = bufio.NewCachedConn(conn, requestBody)
 		}
-		s.handler.NewConnection(request.Context(), conn, metadata)
+		s.handler.NewConnectionEx(DupContext(request.Context()), conn, source, M.Socksaddr{}, nil)
 	} else {
 		writer.WriteHeader(http.StatusOK)
+		flusher := writer.(http.Flusher)
+		flusher.Flush()
+		done := make(chan struct{})
 		conn := NewHTTP2Wrapper(&ServerHTTPConn{
 			NewHTTPConn(request.Body, writer),
-			writer.(http.Flusher),
+			flusher,
 		})
-		s.handler.NewConnection(request.Context(), conn, metadata)
+		s.handler.NewConnectionEx(request.Context(), conn, source, M.Socksaddr{}, N.OnceClose(func(it error) {
+			close(done)
+		}))
+		<-done
 		conn.CloseWrapper()
 	}
 }
@@ -143,7 +164,7 @@ func (s *Server) invalidRequest(writer http.ResponseWriter, request *http.Reques
 	if statusCode > 0 {
 		writer.WriteHeader(statusCode)
 	}
-	s.handler.NewError(request.Context(), E.Cause(err, "process connection from ", request.RemoteAddr))
+	s.logger.ErrorContext(request.Context(), E.Cause(err, "process connection from ", request.RemoteAddr))
 }
 
 func (s *Server) Network() []string {
@@ -155,7 +176,7 @@ func (s *Server) Serve(listener net.Listener) error {
 		if len(s.tlsConfig.NextProtos()) == 0 {
 			s.tlsConfig.SetNextProtos([]string{http2.NextProtoTLS, "http/1.1"})
 		} else if !common.Contains(s.tlsConfig.NextProtos(), http2.NextProtoTLS) {
-			s.tlsConfig.SetNextProtos(append([]string{"h2"}, s.tlsConfig.NextProtos()...))
+			s.tlsConfig.SetNextProtos(append([]string{http2.NextProtoTLS}, s.tlsConfig.NextProtos()...))
 		}
 		listener = aTLS.NewListener(listener, s.tlsConfig)
 	}

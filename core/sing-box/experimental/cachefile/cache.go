@@ -12,9 +12,11 @@ import (
 	"github.com/sagernet/bbolt"
 	bboltErrors "github.com/sagernet/bbolt/errors"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/service/filemanager"
 )
 
@@ -30,6 +32,7 @@ var (
 		string(bucketMode),
 		string(bucketRuleSet),
 		string(bucketRDRC),
+		string(bucketDNSCache),
 	}
 
 	cacheIDDefault = []byte("default")
@@ -38,29 +41,46 @@ var (
 var _ adapter.CacheFile = (*CacheFile)(nil)
 
 type CacheFile struct {
-	ctx               context.Context
-	path              string
-	cacheID           []byte
-	storeFakeIP       bool
-	storeRDRC         bool
-	rdrcTimeout       time.Duration
-	DB                *bbolt.DB
-	saveMetadataTimer *time.Timer
-	saveFakeIPAccess  sync.RWMutex
-	saveDomain        map[netip.Addr]string
-	saveAddress4      map[string]netip.Addr
-	saveAddress6      map[string]netip.Addr
-	saveRDRCAccess    sync.RWMutex
-	saveRDRC          map[saveRDRCCacheKey]bool
+	ctx                context.Context
+	logger             logger.Logger
+	path               string
+	cacheID            []byte
+	cacheIDText        string
+	storeFakeIP        bool
+	storeRDRC          bool
+	storeDNS           bool
+	disableExpire      bool
+	rdrcTimeout        time.Duration
+	optimisticTimeout  time.Duration
+	DB                 *bbolt.DB
+	dbAccess           sync.RWMutex
+	saveMetadataAccess sync.Mutex
+	saveMetadata       *adapter.FakeIPMetadata
+	saveMetadataTimer  *time.Timer
+	saveFakeIPAccess   sync.RWMutex
+	saveDomain         map[netip.Addr]string
+	saveAddress4       map[string]netip.Addr
+	saveAddress6       map[string]netip.Addr
+	saveRDRCAccess     sync.RWMutex
+	saveRDRC           map[saveCacheKey]bool
+	saveDNSCacheAccess sync.RWMutex
+	saveDNSCache       map[saveCacheKey]saveDNSCacheEntry
 }
 
-type saveRDRCCacheKey struct {
+type saveCacheKey struct {
 	TransportName string
 	QuestionName  string
 	QType         uint16
 }
 
-func New(ctx context.Context, options option.CacheFileOptions) *CacheFile {
+type saveDNSCacheEntry struct {
+	rawMessage []byte
+	expireAt   time.Time
+	sequence   uint64
+	saving     bool
+}
+
+func New(ctx context.Context, logger logger.Logger, options option.CacheFileOptions) *CacheFile {
 	var path string
 	if options.Path != "" {
 		path = options.Path
@@ -70,6 +90,9 @@ func New(ctx context.Context, options option.CacheFileOptions) *CacheFile {
 	var cacheIDBytes []byte
 	if options.CacheID != "" {
 		cacheIDBytes = append([]byte{0}, []byte(options.CacheID)...)
+	}
+	if options.StoreRDRC {
+		deprecated.Report(ctx, deprecated.OptionStoreRDRC)
 	}
 	var rdrcTimeout time.Duration
 	if options.StoreRDRC {
@@ -81,40 +104,111 @@ func New(ctx context.Context, options option.CacheFileOptions) *CacheFile {
 	}
 	return &CacheFile{
 		ctx:          ctx,
+		logger:       logger,
 		path:         filemanager.BasePath(ctx, path),
 		cacheID:      cacheIDBytes,
+		cacheIDText:  options.CacheID,
 		storeFakeIP:  options.StoreFakeIP,
 		storeRDRC:    options.StoreRDRC,
+		storeDNS:     options.StoreDNS,
 		rdrcTimeout:  rdrcTimeout,
 		saveDomain:   make(map[netip.Addr]string),
 		saveAddress4: make(map[string]netip.Addr),
 		saveAddress6: make(map[string]netip.Addr),
-		saveRDRC:     make(map[saveRDRCCacheKey]bool),
+		saveRDRC:     make(map[saveCacheKey]bool),
+		saveDNSCache: make(map[saveCacheKey]saveDNSCacheEntry),
+	}
+}
+
+func (c *CacheFile) Name() string {
+	return "cache-file"
+}
+
+func (c *CacheFile) Dependencies() []string {
+	return nil
+}
+
+func (c *CacheFile) CacheID() string {
+	return c.cacheIDText
+}
+
+func (c *CacheFile) SetOptimisticTimeout(timeout time.Duration) {
+	c.optimisticTimeout = timeout
+}
+
+func (c *CacheFile) SetDisableExpire(disableExpire bool) {
+	c.disableExpire = disableExpire
+}
+
+func (c *CacheFile) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	switch stage {
+	case adapter.StartStateInitialize:
+		err := c.start()
+		if err != nil {
+			return err
+		}
+		scope.Add(func() error {
+			return c.database().Close()
+		})
+	case adapter.StartStateStart:
+		c.startCacheCleanup()
+	}
+	return nil
+}
+
+func (c *CacheFile) startCacheCleanup() {
+	if c.storeDNS {
+		c.clearRDRC()
+		c.cleanupDNSCache()
+		interval := c.optimisticTimeout / 2
+		if interval <= 0 {
+			interval = time.Hour
+		}
+		go c.loopCacheCleanup(interval, c.cleanupDNSCache)
+	} else if c.storeRDRC {
+		c.cleanupRDRC()
+		interval := c.rdrcTimeout / 2
+		if interval <= 0 {
+			interval = time.Hour
+		}
+		go c.loopCacheCleanup(interval, c.cleanupRDRC)
 	}
 }
 
 func (c *CacheFile) start() error {
 	const fileMode = 0o666
+	cacheFile, err := filemanager.OpenFile(c.ctx, c.path, os.O_RDWR|os.O_CREATE, fileMode)
+	if err != nil {
+		return err
+	}
+	cacheFile.Close()
 	options := bbolt.Options{Timeout: time.Second}
-	var (
-		db  *bbolt.DB
-		err error
-	)
-	for i := 0; i < 10; i++ {
+	var db *bbolt.DB
+	for range 10 {
 		db, err = bbolt.Open(c.path, fileMode, &options)
+		if err != nil {
+			if errors.Is(err, bboltErrors.ErrTimeout) {
+				continue
+			}
+			if E.IsMulti(err, bboltErrors.ErrInvalid, bboltErrors.ErrChecksum, bboltErrors.ErrVersionMismatch) {
+				rmErr := filemanager.Remove(c.ctx, c.path)
+				if rmErr != nil {
+					return err
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		err = checkDatabase(db)
 		if err == nil {
 			break
 		}
-		if errors.Is(err, bboltErrors.ErrTimeout) {
-			continue
+		c.logger.Error("database corrupted: ", err, ": resetting")
+		db.Close()
+		rmErr := filemanager.Remove(c.ctx, c.path)
+		if rmErr != nil {
+			return err
 		}
-		if E.IsMulti(err, bboltErrors.ErrInvalid, bboltErrors.ErrChecksum, bboltErrors.ErrVersionMismatch) {
-			rmErr := os.Remove(c.path)
-			if rmErr != nil {
-				return err
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
 	}
 	if err != nil {
 		return err
@@ -129,7 +223,7 @@ func (c *CacheFile) start() error {
 			if name[0] == 0 {
 				return b.ForEachBucket(func(k []byte) error {
 					bucketName := string(k)
-					if !(common.Contains(bucketNameList, bucketName)) {
+					if !common.Contains(bucketNameList, bucketName) {
 						_ = b.DeleteBucket(name)
 					}
 					return nil
@@ -151,19 +245,80 @@ func (c *CacheFile) start() error {
 	return nil
 }
 
-func (c *CacheFile) PreStart() error {
-	return c.start()
+func checkDatabase(db *bbolt.DB) error {
+	return db.View(func(tx *bbolt.Tx) error {
+		var checkErr error
+		for txErr := range tx.Check() {
+			if checkErr == nil {
+				checkErr = txErr
+			}
+		}
+		return checkErr
+	})
 }
 
-func (c *CacheFile) Start() error {
-	return nil
+func (c *CacheFile) database() *bbolt.DB {
+	c.dbAccess.RLock()
+	defer c.dbAccess.RUnlock()
+	return c.DB
 }
 
-func (c *CacheFile) Close() error {
-	if c.DB == nil {
-		return nil
+func (c *CacheFile) view(fn func(tx *bbolt.Tx) error) (err error) {
+	db := c.database()
+	defer func() {
+		r := recover()
+		if r != nil {
+			c.resetDB(db, r)
+			err = E.New("database corrupted: ", r)
+		}
+	}()
+	return db.View(fn)
+}
+
+func (c *CacheFile) batch(fn func(tx *bbolt.Tx) error) (err error) {
+	db := c.database()
+	defer func() {
+		r := recover()
+		if r != nil {
+			c.resetDB(db, r)
+			err = E.New("database corrupted: ", r)
+		}
+	}()
+	err = db.Batch(fn)
+	var panicErr bbolt.PanickedError
+	if errors.As(err, &panicErr) {
+		c.resetDB(db, panicErr.Reason)
+		return E.New("database corrupted: ", panicErr.Reason)
 	}
-	return c.DB.Close()
+	return err
+}
+
+func (c *CacheFile) update(fn func(tx *bbolt.Tx) error) (err error) {
+	db := c.database()
+	defer func() {
+		r := recover()
+		if r != nil {
+			c.resetDB(db, r)
+			err = E.New("database corrupted: ", r)
+		}
+	}()
+	return db.Update(fn)
+}
+
+func (c *CacheFile) resetDB(failedDB *bbolt.DB, reason any) {
+	c.dbAccess.Lock()
+	defer c.dbAccess.Unlock()
+	if c.DB != failedDB {
+		return
+	}
+	c.logger.Error("database corrupted: ", reason, ": resetting")
+	failedDB.Close()
+	filemanager.Remove(c.ctx, c.path)
+	db, err := bbolt.Open(c.path, 0o666, &bbolt.Options{Timeout: time.Second})
+	if err == nil {
+		_ = filemanager.Chown(c.ctx, c.path)
+		c.DB = db
+	}
 }
 
 func (c *CacheFile) StoreFakeIP() bool {
@@ -172,7 +327,7 @@ func (c *CacheFile) StoreFakeIP() bool {
 
 func (c *CacheFile) LoadMode() string {
 	var mode string
-	c.DB.View(func(t *bbolt.Tx) error {
+	c.view(func(t *bbolt.Tx) error {
 		bucket := t.Bucket(bucketMode)
 		if bucket == nil {
 			return nil
@@ -190,7 +345,7 @@ func (c *CacheFile) LoadMode() string {
 }
 
 func (c *CacheFile) StoreMode(mode string) error {
-	return c.DB.Batch(func(t *bbolt.Tx) error {
+	return c.batch(func(t *bbolt.Tx) error {
 		bucket, err := t.CreateBucketIfNotExists(bucketMode)
 		if err != nil {
 			return err
@@ -227,7 +382,7 @@ func (c *CacheFile) createBucket(t *bbolt.Tx, key []byte) (*bbolt.Bucket, error)
 
 func (c *CacheFile) LoadSelected(group string) string {
 	var selected string
-	c.DB.View(func(t *bbolt.Tx) error {
+	c.view(func(t *bbolt.Tx) error {
 		bucket := c.bucket(t, bucketSelected)
 		if bucket == nil {
 			return nil
@@ -242,7 +397,7 @@ func (c *CacheFile) LoadSelected(group string) string {
 }
 
 func (c *CacheFile) StoreSelected(group, selected string) error {
-	return c.DB.Batch(func(t *bbolt.Tx) error {
+	return c.batch(func(t *bbolt.Tx) error {
 		bucket, err := c.createBucket(t, bucketSelected)
 		if err != nil {
 			return err
@@ -252,7 +407,7 @@ func (c *CacheFile) StoreSelected(group, selected string) error {
 }
 
 func (c *CacheFile) LoadGroupExpand(group string) (isExpand bool, loaded bool) {
-	c.DB.View(func(t *bbolt.Tx) error {
+	c.view(func(t *bbolt.Tx) error {
 		bucket := c.bucket(t, bucketExpand)
 		if bucket == nil {
 			return nil
@@ -268,7 +423,7 @@ func (c *CacheFile) LoadGroupExpand(group string) (isExpand bool, loaded bool) {
 }
 
 func (c *CacheFile) StoreGroupExpand(group string, isExpand bool) error {
-	return c.DB.Batch(func(t *bbolt.Tx) error {
+	return c.batch(func(t *bbolt.Tx) error {
 		bucket, err := c.createBucket(t, bucketExpand)
 		if err != nil {
 			return err
@@ -281,9 +436,9 @@ func (c *CacheFile) StoreGroupExpand(group string, isExpand bool) error {
 	})
 }
 
-func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedRuleSet {
-	var savedSet adapter.SavedRuleSet
-	err := c.DB.View(func(t *bbolt.Tx) error {
+func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedBinary {
+	var savedSet adapter.SavedBinary
+	err := c.view(func(t *bbolt.Tx) error {
 		bucket := c.bucket(t, bucketRuleSet)
 		if bucket == nil {
 			return os.ErrNotExist
@@ -300,8 +455,8 @@ func (c *CacheFile) LoadRuleSet(tag string) *adapter.SavedRuleSet {
 	return &savedSet
 }
 
-func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedRuleSet) error {
-	return c.DB.Batch(func(t *bbolt.Tx) error {
+func (c *CacheFile) SaveRuleSet(tag string, set *adapter.SavedBinary) error {
+	return c.batch(func(t *bbolt.Tx) error {
 		bucket, err := c.createBucket(t, bucketRuleSet)
 		if err != nil {
 			return err

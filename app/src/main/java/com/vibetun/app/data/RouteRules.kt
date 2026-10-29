@@ -5,9 +5,20 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-enum class RouteAction { PROXY, DIRECT }
+enum class RouteAction {
+    PROXY,
+    DIRECT,
 
-enum class RouteRuleType { DOMAIN_SUFFIX, KEYWORD, IP_CIDR }
+    /** Заблокировать трафик: адрес недоступен (как в sing-box outbound типа block). */
+    BLOCK,
+}
+
+/** Тип правила маршрутизации; определяется автоматически по введённому значению. */
+enum class RouteRuleType(val label: String) {
+    DOMAIN_SUFFIX("домен"),
+    KEYWORD("слово"),
+    IP_CIDR("ip"),
+}
 
 /**
  * Правило маршрутизации, как в Windows-версии: значение + действие.
@@ -18,7 +29,14 @@ data class RouteRule(
     val value: String,
     val action: RouteAction,
     val type: RouteRuleType = detectType(value),
+
+    /** Выключенное правило не попадает в конфигурацию ядра (галочка в списке маршрутов). */
+    val enabled: Boolean = true,
 ) {
+    /** Подпись типа для интерфейса: «домен», «ip», «слово». */
+    val typeLabel: String
+        get() = type.label
+
     companion object {
         private val DOMAIN = Regex("^(?:\\*\\.)?(?:[a-zA-Z0-9-]+\\.)+[a-zA-Z]{2,}$")
         private val IPV4 = Regex("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}(?:/(?:[0-9]|[12][0-9]|3[0-2]))?$")
@@ -81,39 +99,53 @@ class RouteSetStore(context: Context) {
         File(dir, "$setName.json").writeText(toJson(rules))
     }
 
-    fun toJson(rules: List<RouteRule>): String {
-        val array = JSONArray()
-        rules.forEach { rule ->
-            array.put(
-                JSONObject()
-                    .put("value", rule.value)
-                    .put("action", rule.action.name.lowercase())
-                    .put("type", rule.type.name),
-            )
-        }
-        return array.toString()
-    }
+    fun toJson(rules: List<RouteRule>): String = routeRulesToJson(rules)
 
-    fun parseJson(text: String): List<RouteRule> {
-        val array = JSONArray(text)
-        return buildList {
-            for (index in 0 until array.length()) {
-                val item = array.optJSONObject(index) ?: continue
-                val value = item.optString("value").trim()
-                if (value.isBlank()) continue
-                val action = if (item.optString("action").equals("direct", ignoreCase = true)) {
-                    RouteAction.DIRECT
-                } else {
-                    RouteAction.PROXY
-                }
-                add(RouteRule(value, action))
-            }
-        }
-    }
+    fun parseJson(text: String): List<RouteRule> = parseRouteRulesJson(text)
 
     companion object {
         /** Валидация значения правила: не пустое, одна строка. */
         fun isValidValue(value: String): Boolean = value.isNotBlank() && !value.contains('\n')
+    }
+}
+
+/**
+ * Сериализация правил в JSON: значение, действие, тип и флаг включения.
+ * Вынесено в чистую функцию, чтобы тестировать без Android-контекста.
+ */
+fun routeRulesToJson(rules: List<RouteRule>): String {
+    val array = JSONArray()
+    rules.forEach { rule ->
+        array.put(
+            JSONObject()
+                .put("value", rule.value)
+                .put("action", rule.action.name.lowercase())
+                .put("type", rule.type.name)
+                .put("enabled", rule.enabled),
+        )
+    }
+    return array.toString()
+}
+
+/**
+ * Разбор JSON набора правил. Старые файлы без поля «enabled» считаются включёнными,
+ * неизвестное действие трактуется как PROXY.
+ */
+fun parseRouteRulesJson(text: String): List<RouteRule> {
+    val array = JSONArray(text)
+    return buildList {
+        for (index in 0 until array.length()) {
+            val item = array.optJSONObject(index) ?: continue
+            val value = item.optString("value").trim()
+            if (value.isBlank()) continue
+            val action = when (item.optString("action").lowercase()) {
+                "direct" -> RouteAction.DIRECT
+                "block" -> RouteAction.BLOCK
+                else -> RouteAction.PROXY
+            }
+            val enabled = if (item.has("enabled")) item.optBoolean("enabled", true) else true
+            add(RouteRule(value, action, RouteRule.detectType(value), enabled))
+        }
     }
 }
 

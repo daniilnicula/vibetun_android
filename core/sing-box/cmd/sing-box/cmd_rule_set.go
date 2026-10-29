@@ -1,4 +1,4 @@
-package boxmain
+package main
 
 import (
 	"github.com/spf13/cobra"
@@ -6,7 +6,7 @@ import (
 
 var commandRuleSet = &cobra.Command{
 	Use:   "rule-set",
-	Short: "Manage rule sets",
+	Short: "Manage rule-sets",
 }
 
 func init() {

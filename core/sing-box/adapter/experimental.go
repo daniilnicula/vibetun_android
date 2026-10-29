@@ -5,34 +5,38 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
-	"net"
 	"time"
 
-	"github.com/sagernet/sing-box/common/urltest"
-	"github.com/sagernet/sing-dns"
-	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/rw"
+	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/varbin"
 )
 
-type ClashServer interface {
-	Service
-	PreStarter
-	Mode() string
-	ModeList() []string
-	HistoryStorage() *urltest.HistoryStorage
-	RoutedConnection(ctx context.Context, conn net.Conn, metadata InboundContext, matchedRule Rule) (net.Conn, Tracker)
-	RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata InboundContext, matchedRule Rule) (N.PacketConn, Tracker)
+type URLTestHistory struct {
+	Time  time.Time `json:"time"`
+	Delay uint16    `json:"delay"`
+}
+
+type V2RayServer interface {
+	LifecycleService
+	StatsService() ConnectionTracker
 }
 
 type CacheFile interface {
-	Service
-	PreStarter
+	LifecycleService
+
+	CacheID() string
 
 	StoreFakeIP() bool
 	FakeIPStorage
 
 	StoreRDRC() bool
-	dns.RDRCStore
+	RDRCStore
+
+	StoreDNS() bool
+	DNSCacheStore
+
+	SetDisableExpire(disableExpire bool)
+	SetOptimisticTimeout(timeout time.Duration)
 
 	LoadMode() string
 	StoreMode(mode string) error
@@ -40,50 +44,69 @@ type CacheFile interface {
 	StoreSelected(group string, selected string) error
 	LoadGroupExpand(group string) (isExpand bool, loaded bool)
 	StoreGroupExpand(group string, expand bool) error
-	LoadRuleSet(tag string) *SavedRuleSet
-	SaveRuleSet(tag string, set *SavedRuleSet) error
+	LoadRuleSet(tag string) *SavedBinary
+	SaveRuleSet(tag string, set *SavedBinary) error
 }
 
-type SavedRuleSet struct {
+type SavedBinary struct {
 	Content     []byte
 	LastUpdated time.Time
 	LastEtag    string
+	URLHash     []byte
 }
 
-func (s *SavedRuleSet) MarshalBinary() ([]byte, error) {
+func (s *SavedBinary) MarshalBinary() ([]byte, error) {
 	var buffer bytes.Buffer
-	err := binary.Write(&buffer, binary.BigEndian, uint8(1))
+	err := binary.Write(&buffer, binary.BigEndian, uint8(2))
 	if err != nil {
 		return nil, err
 	}
-	err = rw.WriteUVariant(&buffer, uint64(len(s.Content)))
+	_, err = varbin.WriteUvarint(&buffer, uint64(len(s.Content)))
 	if err != nil {
 		return nil, err
 	}
-	buffer.Write(s.Content)
+	_, err = buffer.Write(s.Content)
+	if err != nil {
+		return nil, err
+	}
 	err = binary.Write(&buffer, binary.BigEndian, s.LastUpdated.Unix())
 	if err != nil {
 		return nil, err
 	}
-	err = rw.WriteVString(&buffer, s.LastEtag)
+	_, err = varbin.WriteUvarint(&buffer, uint64(len(s.LastEtag)))
+	if err != nil {
+		return nil, err
+	}
+	_, err = buffer.WriteString(s.LastEtag)
+	if err != nil {
+		return nil, err
+	}
+	_, err = varbin.WriteUvarint(&buffer, uint64(len(s.URLHash)))
+	if err != nil {
+		return nil, err
+	}
+	_, err = buffer.Write(s.URLHash)
 	if err != nil {
 		return nil, err
 	}
 	return buffer.Bytes(), nil
 }
 
-func (s *SavedRuleSet) UnmarshalBinary(data []byte) error {
+func (s *SavedBinary) UnmarshalBinary(data []byte) error {
 	reader := bytes.NewReader(data)
 	var version uint8
 	err := binary.Read(reader, binary.BigEndian, &version)
 	if err != nil {
 		return err
 	}
-	contentLen, err := rw.ReadUVariant(reader)
+	contentLength, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return err
 	}
-	s.Content = make([]byte, contentLen)
+	if contentLength > uint64(reader.Len()) {
+		return E.New("invalid content length: ", contentLength)
+	}
+	s.Content = make([]byte, contentLength)
 	_, err = io.ReadFull(reader, s.Content)
 	if err != nil {
 		return err
@@ -94,41 +117,46 @@ func (s *SavedRuleSet) UnmarshalBinary(data []byte) error {
 		return err
 	}
 	s.LastUpdated = time.Unix(lastUpdated, 0)
-	s.LastEtag, err = rw.ReadVString(reader)
+	etagLength, err := binary.ReadUvarint(reader)
+	if err != nil {
+		return err
+	}
+	if etagLength > uint64(reader.Len()) {
+		return E.New("invalid etag length: ", etagLength)
+	}
+	etagBytes := make([]byte, etagLength)
+	_, err = io.ReadFull(reader, etagBytes)
+	if err != nil {
+		return err
+	}
+	s.LastEtag = string(etagBytes)
+	if version < 2 {
+		return nil
+	}
+	urlHashLength, err := binary.ReadUvarint(reader)
+	if err != nil {
+		return err
+	}
+	if urlHashLength > uint64(reader.Len()) {
+		return E.New("invalid url hash length: ", urlHashLength)
+	}
+	s.URLHash = make([]byte, urlHashLength)
+	_, err = io.ReadFull(reader, s.URLHash)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-type Tracker interface {
-	Leave()
-}
-
 type OutboundGroup interface {
 	Outbound
-	Now() string
 	All() []string
+	Selected(network string) Outbound
+	AttachConnection(closer io.Closer) (detach func())
 }
 
 type URLTestGroup interface {
 	OutboundGroup
 	URLTest(ctx context.Context) (map[string]uint16, error)
-}
-
-func OutboundTag(detour Outbound) string {
-	if group, isGroup := detour.(OutboundGroup); isGroup {
-		return group.Now()
-	}
-	return detour.Tag()
-}
-
-type V2RayServer interface {
-	Service
-	StatsService() V2RayStatsService
-}
-
-type V2RayStatsService interface {
-	RoutedConnection(inbound string, outbound string, user string, conn net.Conn) net.Conn
-	RoutedPacketConnection(inbound string, outbound string, user string, conn N.PacketConn) N.PacketConn
+	PerformUpdateCheck()
 }

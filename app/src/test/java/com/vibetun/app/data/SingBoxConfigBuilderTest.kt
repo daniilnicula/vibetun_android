@@ -31,6 +31,28 @@ class SingBoxConfigBuilderTest {
         assertEquals("ws", outbound.getJSONObject("transport").getString("type"))
         assertEquals("/connect", outbound.getJSONObject("transport").getString("path"))
         assertEquals("vibetun-proxy", config.getJSONObject("route").getString("final"))
+        assertEquals(SingBoxConfigBuilder.DEFAULT_TUN_MTU, tun.getInt("mtu"))
+    }
+
+    @Test
+    fun `applies custom MTU to standard and full JSON TUN configs`() {
+        val standard = JSONObject(
+            SingBoxConfigBuilder.build(profile("socks", "socks5://127.0.0.1:1080"), tunMtu = 1420),
+        )
+        assertEquals(1420, standard.getJSONArray("inbounds").getJSONObject(0).getInt("mtu"))
+
+        val raw = """{"inbounds":[{"type":"tun","mtu":9000}],"outbounds":[{"type":"vless","tag":"proxy","server":"full.example","server_port":443,"uuid":"u"}],"route":{"final":"proxy"}}"""
+        val full = JSONObject(SingBoxConfigBuilder.build(profile("vless", raw), tunMtu = 1280))
+        assertEquals(1280, full.getJSONArray("inbounds").getJSONObject(0).getInt("mtu"))
+    }
+
+    @Test
+    fun `rejects invalid TUN MTU`() {
+        val error = runCatching {
+            SingBoxConfigBuilder.build(profile("socks", "socks5://127.0.0.1:1080"), tunMtu = 150)
+        }.exceptionOrNull()
+        assertTrue(error is IllegalArgumentException)
+        assertTrue(error?.message.orEmpty().contains("MTU"))
     }
 
     @Test
@@ -82,13 +104,14 @@ class SingBoxConfigBuilderTest {
             throw AssertionError("WireGuard INI conversion failed: ${error.message}", error)
         }
         val config = JSONObject(configTextJson)
-        val outbound = config.getJSONArray("outbounds").getJSONObject(0)
-        val peer = outbound.getJSONArray("peers").getJSONObject(0)
+        val endpoint = config.getJSONArray("endpoints").getJSONObject(0)
+        val peer = endpoint.getJSONArray("peers").getJSONObject(0)
 
-        assertEquals("wireguard", outbound.getString("type"))
-        assertEquals("private-key", outbound.getString("private_key"))
-        assertEquals("10.0.0.2/32", outbound.getJSONArray("local_address").getString(0))
-        assertEquals("wg.example", peer.getString("server"))
+        assertEquals("wireguard", endpoint.getString("type"))
+        assertEquals("private-key", endpoint.getString("private_key"))
+        assertEquals("10.0.0.2/32", endpoint.getJSONArray("address").getString(0))
+        assertEquals("wg.example", peer.getString("address"))
+        assertEquals(51820, peer.getInt("port"))
         assertEquals("public-key", peer.getString("public_key"))
         assertEquals(2, peer.getJSONArray("allowed_ips").length())
     }
@@ -102,16 +125,23 @@ class SingBoxConfigBuilderTest {
         assertEquals("gvisor", config.getJSONArray("inbounds").getJSONObject(0).getString("stack"))
         assertEquals("upstream", config.getJSONObject("route").getString("final"))
         assertTrue(config.getJSONObject("route").getBoolean("auto_detect_interface"))
+        val dnsServers = config.getJSONObject("dns").getJSONArray("servers")
+        val proxyDns = (0 until dnsServers.length()).map { dnsServers.getJSONObject(it) }
+            .first { it.optString("tag") == "vibetun-dns" }
+        assertEquals("upstream", proxyDns.getString("detour"))
     }
 
     @Test
-    fun `rejects protocols that the bundled core does not implement`() {
-        val error = runCatching {
-            SingBoxConfigBuilder.build(profile("anytls", "anytls://password@server.example:443"))
-        }.exceptionOrNull()
+    fun `builds AnyTLS profile with TLS`() {
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(profile("anytls", "anytls://password@server.example:443?sni=cdn.example")),
+        )
+        val outbound = config.getJSONArray("outbounds").getJSONObject(0)
 
-        assertTrue(error is IllegalArgumentException)
-        assertTrue(error?.message.orEmpty().contains("AnyTLS"))
+        assertEquals("anytls", outbound.getString("type"))
+        assertEquals("password", outbound.getString("password"))
+        assertTrue(outbound.getJSONObject("tls").getBoolean("enabled"))
+        assertEquals("cdn.example", outbound.getJSONObject("tls").getString("server_name"))
     }
 
     @Test
@@ -149,6 +179,25 @@ class SingBoxConfigBuilderTest {
         // голый IP нормализуется в /32, готовая подсеть не трогается
         assertEquals("203.0.113.7/32", byOutbound.getValue("vibetun-direct:cidr").getJSONArray("ip_cidr").getString(0))
         assertEquals("198.51.100.0/24", byOutbound.getValue("vibetun-proxy:cidr").getJSONArray("ip_cidr").getString(0))
+    }
+
+    @Test
+    fun `BLOCK uses reject and disabled rules are omitted`() {
+        val rules = listOf(
+            RouteRule("blocked.example", RouteAction.BLOCK),
+            RouteRule("disabled.example", RouteAction.DIRECT, enabled = false),
+        )
+        val config = JSONObject(
+            SingBoxConfigBuilder.build(profile("socks", "socks5://127.0.0.1:1080"), routeRules = rules),
+        )
+        val routeRules = config.getJSONObject("route").getJSONArray("rules")
+        val block = (0 until routeRules.length()).map { routeRules.getJSONObject(it) }
+            .first { it.optString("action") == "reject" && it.has("domain_suffix") }
+
+        assertEquals("blocked.example", block.getJSONArray("domain_suffix").getString(0))
+        assertFalse(block.has("outbound"))
+        assertFalse(routeRules.toString().contains("disabled.example"))
+        assertFalse(config.getJSONObject("dns").getJSONArray("rules").toString().contains("disabled.example"))
     }
 
     @Test
@@ -197,11 +246,10 @@ class SingBoxConfigBuilderTest {
         val directSuffix = (0 until rules.length()).map { rules.getJSONObject(it) }
             .first { it.optString("outbound") == "vibetun-direct" && it.has("domain_suffix") }
         assertEquals("io", directSuffix.getJSONArray("domain_suffix").getString(0))
-        // снифф включён (доменные правила работают через metadata.Domain),
-        // но override выключен — ip_cidr матчится по исходному IP, а не по резолвленному.
+        // Снифф — первое route-действие; старые поля TUN в 1.14 удалены.
+        assertEquals("sniff", rules.getJSONObject(0).getString("action"))
         val tun = config.getJSONArray("inbounds").getJSONObject(0)
-        assertTrue(tun.getBoolean("sniff"))
-        assertTrue(!tun.has("sniff_override_destination") || !tun.getBoolean("sniff_override_destination"))
+        assertFalse(tun.has("sniff_override_destination"))
         assertTrue(config.getJSONObject("dns").getBoolean("reverse_mapping"))
     }
 
@@ -222,24 +270,25 @@ class SingBoxConfigBuilderTest {
     )
 
     @Test
-    fun `routes DNS from TUN to dns outbound before any other rule`() {
+    fun `routes sniff DNS hijack and QUIC rejection before other rules`() {
         val config = JSONObject(SingBoxConfigBuilder.build(profile("hysteria2", "hy2://pass@hy.example:443")))
-        val tun = config.getJSONArray("inbounds").getJSONObject(0)
-        assertTrue(tun.getBoolean("sniff"))
-
         val outboundTypes = (0 until config.getJSONArray("outbounds").length())
             .map { config.getJSONArray("outbounds").getJSONObject(it).getString("type") }
-        assertTrue("dns" in outboundTypes)
+        assertFalse("dns" in outboundTypes)
+        assertFalse("block" in outboundTypes)
 
         val rules = config.getJSONObject("route").getJSONArray("rules")
-        val first = rules.getJSONObject(0)
-        val second = rules.getJSONObject(1)
-        assertEquals("dns", first.getString("protocol"))
-        assertEquals("vibetun-dns-out", first.getString("outbound"))
-        assertEquals(53, second.getInt("port"))
-        assertEquals("vibetun-dns-out", second.getString("outbound"))
-        // QUIC-блокировка стоит после DNS-правил
-        assertEquals("udp", rules.getJSONObject(2).getString("network"))
+        assertEquals("sniff", rules.getJSONObject(0).getString("action"))
+        val dnsProtocol = rules.getJSONObject(1)
+        assertEquals("dns", dnsProtocol.getString("protocol"))
+        assertEquals("hijack-dns", dnsProtocol.getString("action"))
+        val dnsPort = rules.getJSONObject(2)
+        assertEquals(53, dnsPort.getInt("port"))
+        assertEquals("hijack-dns", dnsPort.getString("action"))
+        val quic = rules.getJSONObject(3)
+        assertEquals("udp", quic.getString("network"))
+        assertEquals(443, quic.getInt("port"))
+        assertEquals("reject", quic.getString("action"))
     }
 
     @Test
@@ -249,7 +298,12 @@ class SingBoxConfigBuilderTest {
         val servers = dns.getJSONArray("servers")
         val directServer = (0 until servers.length()).map { servers.getJSONObject(it) }
             .first { it.getString("tag") == "vibetun-dns-direct" }
-        assertEquals("vibetun-direct", directServer.getString("detour"))
+        val directResolver = (0 until servers.length()).map { servers.getJSONObject(it) }
+            .first { it.getString("tag") == "vibetun-dns-direct-resolver" }
+        // В 1.14 прямой DNS использует собственный dialer; detour на пустой direct-outbound
+        // не нужен и приводит к отказу запуска всех sing-box протоколов.
+        assertFalse(directServer.has("detour"))
+        assertFalse(directResolver.has("detour"))
 
         val bootstrap = dns.getJSONArray("rules").getJSONObject(0)
         assertEquals("vibetun-dns-direct", bootstrap.getString("server"))
@@ -266,16 +320,17 @@ class SingBoxConfigBuilderTest {
     }
 
     @Test
-    fun `full JSON config gets DNS outbound, sniff and bootstrap`() {
+    fun `full JSON config gets route actions sniff and bootstrap without legacy outbounds`() {
         val raw = """{"outbounds":[{"type":"vless","tag":"proxy","server":"full.example","server_port":443,"uuid":"u"}],"route":{"final":"proxy"}}"""
         val config = JSONObject(SingBoxConfigBuilder.build(profile("vless", raw)))
         val types = (0 until config.getJSONArray("outbounds").length())
             .map { config.getJSONArray("outbounds").getJSONObject(it).getString("type") }
-        assertTrue("dns" in types)
+        assertFalse("dns" in types)
+        assertFalse("block" in types)
         assertTrue("direct" in types)
-        assertTrue(config.getJSONArray("inbounds").getJSONObject(0).getBoolean("sniff"))
-        val firstRule = config.getJSONObject("route").getJSONArray("rules").getJSONObject(0)
-        assertEquals("dns", firstRule.getString("protocol"))
+        val rules = config.getJSONObject("route").getJSONArray("rules")
+        assertEquals("sniff", rules.getJSONObject(0).getString("action"))
+        assertEquals("hijack-dns", rules.getJSONObject(1).getString("action"))
         val dnsRules = config.getJSONObject("dns").getJSONArray("rules")
         assertEquals("full.example", dnsRules.getJSONObject(0).getJSONArray("domain").getString(0))
     }
@@ -293,12 +348,14 @@ class SingBoxConfigBuilderTest {
     }
 
     @Test
-    fun `TUN has sniff but not sniff_override_destination in standard config`() {
+    fun `route has sniff and TUN has no legacy sniff fields in standard config`() {
         val config = JSONObject(
             SingBoxConfigBuilder.build(profile("socks", "socks5://127.0.0.1:1080")),
         )
         val tun = config.getJSONArray("inbounds").getJSONObject(0)
-        assertTrue("sniff must be enabled", tun.getBoolean("sniff"))
+        val rules = config.getJSONObject("route").getJSONArray("rules")
+        assertEquals("sniff", rules.getJSONObject(0).getString("action"))
+        assertFalse(tun.has("sniff"))
         assertFalse(
             "sniff_override_destination must NOT be set (breaks ip_cidr matching)",
             tun.has("sniff_override_destination"),
@@ -306,11 +363,13 @@ class SingBoxConfigBuilderTest {
     }
 
     @Test
-    fun `TUN has sniff but not sniff_override_destination in full JSON config`() {
+    fun `route has sniff and TUN has no legacy sniff fields in full JSON config`() {
         val raw = """{"outbounds":[{"type":"vless","tag":"my-proxy","server":"x.example","server_port":443,"uuid":"u"}],"route":{"final":"my-proxy"}}"""
         val config = JSONObject(SingBoxConfigBuilder.build(profile("vless", raw)))
         val tun = config.getJSONArray("inbounds").getJSONObject(0)
-        assertTrue("sniff must be enabled for full JSON", tun.getBoolean("sniff"))
+        val rules = config.getJSONObject("route").getJSONArray("rules")
+        assertEquals("sniff", rules.getJSONObject(0).getString("action"))
+        assertFalse(tun.has("sniff"))
         assertFalse(
             "sniff_override_destination must be stripped from full JSON",
             tun.has("sniff_override_destination"),
@@ -323,6 +382,7 @@ class SingBoxConfigBuilderTest {
         val rules = listOf(
             RouteRule("youtube.com", RouteAction.PROXY),
             RouteRule("198.51.100.0/24", RouteAction.PROXY),
+            RouteRule("example.org", RouteAction.DIRECT),
         )
         val config = JSONObject(SingBoxConfigBuilder.build(profile("vless", raw), routeRules = rules))
         val routeRules = config.getJSONObject("route").getJSONArray("rules")
@@ -398,6 +458,64 @@ class SingBoxConfigBuilderTest {
             "User's sniff_override_destination must be removed",
             tun.has("sniff_override_destination"),
         )
-        assertTrue(tun.getBoolean("sniff"))
+        assertFalse(tun.has("sniff"))
+        assertEquals("172.19.0.1/30", tun.getJSONArray("address").getString(0))
+        assertEquals("sniff", config.getJSONObject("route").getJSONArray("rules").getJSONObject(0).getString("action"))
+    }
+
+    @Test
+    fun `migrates legacy DNS TUN WireGuard and special outbounds`() {
+        val raw = """
+            {
+              "inbounds":[{"type":"tun","inet4_address":"172.19.0.1/30","inet6_address":["fdfe:dcba:9876::1/126"],"sniff":true,"sniff_override_destination":true}],
+              "outbounds":[
+                {"type":"wireguard","tag":"legacy-wg","server":"wg.example","server_port":51820,"local_address":["10.0.0.2/32"],"private_key":"private","peer_public_key":"public","allowed_ips":["0.0.0.0/0"],"domain_strategy":"ipv4_only"},
+                {"type":"block","tag":"legacy-block"},
+                {"type":"dns","tag":"legacy-dns"}
+              ],
+              "route":{"final":"legacy-wg","rules":[{"port":443,"outbound":"legacy-block"},{"protocol":"dns","outbound":"legacy-dns"}]},
+              "dns":{"servers":[{"tag":"cloudflare","address":"https://1.1.1.1/dns-query"}],"final":"cloudflare"}
+            }
+        """.trimIndent()
+        val config = JSONObject(SingBoxConfigBuilder.build(profile("wireguard", raw)))
+        val tun = config.getJSONArray("inbounds").getJSONObject(0)
+        assertEquals(2, tun.getJSONArray("address").length())
+        assertFalse(tun.has("inet4_address"))
+        assertFalse(tun.has("sniff"))
+
+        val endpoint = config.getJSONArray("endpoints").getJSONObject(0)
+        assertEquals("10.0.0.2/32", endpoint.getJSONArray("address").getString(0))
+        assertFalse(endpoint.has("domain_strategy"))
+        assertEquals("wg.example", endpoint.getJSONArray("peers").getJSONObject(0).getString("address"))
+        val outboundTypes = (0 until config.getJSONArray("outbounds").length())
+            .map { config.getJSONArray("outbounds").getJSONObject(it).getString("type") }
+        assertFalse("wireguard" in outboundTypes)
+        assertFalse("block" in outboundTypes)
+        assertFalse("dns" in outboundTypes)
+
+        val migratedRules = config.getJSONObject("route").getJSONArray("rules")
+        assertTrue((0 until migratedRules.length()).map { migratedRules.getJSONObject(it) }
+            .any { it.optString("action") == "reject" && !it.has("outbound") })
+        assertTrue((0 until migratedRules.length()).map { migratedRules.getJSONObject(it) }
+            .any { it.optString("action") == "hijack-dns" && it.optString("protocol") == "dns" && !it.has("outbound") })
+        val dnsServer = config.getJSONObject("dns").getJSONArray("servers").getJSONObject(0)
+        assertEquals("https", dnsServer.getString("type"))
+        assertEquals("1.1.1.1", dnsServer.getString("server"))
+        assertEquals("/dns-query", dnsServer.getString("path"))
+        assertFalse(dnsServer.has("address"))
+    }
+
+    @Test
+    fun `probe uses a cache file separate from the active VPN service`() {
+        val profile = profile("socks", "socks5://127.0.0.1:1080")
+        val probe = JSONObject(SingBoxConfigBuilder.buildProbeConfig(profile, 12080))
+        val probeCache = probe.getJSONObject("experimental").getJSONObject("cache_file")
+
+        assertTrue(probeCache.getBoolean("enabled"))
+        assertEquals("probe-cache.db", probeCache.getString("path"))
+
+        val service = JSONObject(SingBoxConfigBuilder.build(profile))
+        val serviceCache = service.optJSONObject("experimental")?.optJSONObject("cache_file")
+        assertTrue(serviceCache == null || serviceCache.optString("path") != "probe-cache.db")
     }
 }

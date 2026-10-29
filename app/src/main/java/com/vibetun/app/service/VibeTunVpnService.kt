@@ -31,13 +31,15 @@ import com.vibetun.app.data.VibeTunStore
 import com.vibetun.app.data.ProxyProfile
 import com.vibetun.app.data.RouteSetStore
 import com.vibetun.app.data.SingBoxConfigBuilder
-import io.nekohasekai.libbox.BoxService
+import io.nekohasekai.libbox.CommandServer
+import io.nekohasekai.libbox.ConnectionOwner
 import io.nekohasekai.libbox.InterfaceUpdateListener
 import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.NetworkInterface as LibboxNetworkInterface
 import io.nekohasekai.libbox.NetworkInterfaceIterator as LibboxNetworkInterfaceIterator
-import io.nekohasekai.libbox.PlatformInterface
+import io.nekohasekai.libbox.OverrideOptions
 import io.nekohasekai.libbox.RoutePrefixIterator
+import io.nekohasekai.libbox.SetupOptions
 import io.nekohasekai.libbox.StringIterator
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
@@ -64,7 +66,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * [VibeTunAwgVpnService] (AmneziaWG, процесс `:vpn_awg`). Нужную службу выбирает
  * [VpnServiceLauncher] по протоколу профиля — убивать процесс «на лету» больше не нужно.
  */
-open class VibeTunVpnService : VpnService(), PlatformInterface {
+open class VibeTunVpnService : VpnService(), LibboxPlatformInterface {
     /** Семейство ядра, которое обслуживает эта служба. */
     protected open val engineFamily: String get() = FAMILY_LIBBOX
 
@@ -73,7 +75,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
     private val interfaceCallbacks = mutableMapOf<InterfaceUpdateListener, ConnectivityManager.NetworkCallback>()
 
-    @Volatile private var boxService: BoxService? = null
+    @Volatile private var boxService: CommandServer? = null
     @Volatile private var amneziaHandle: Int = NO_AMNEZIA_HANDLE
     @Volatile private var tunDescriptor: ParcelFileDescriptor? = null
     @Volatile private var lastStoppedAtMs: Long = 0L
@@ -196,6 +198,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
                 // переподключении kill по таймеру убивал только что запрошенный старт, и UI
                 // навсегда оставался в «Поднимаем туннель…», хотя службы уже не было.
                 mainHandler.removeCallbacks(killProcessRunnable)
+                deadTunnelReconnectCounter.reset()
                 // startForegroundService обязывает поднять уведомление в течение 5 с — делаем это
                 // до любых проверок, даже если сейчас пойдёт остановка.
                 promoteToForeground(intent?.getStringExtra(EXTRA_PROFILE_ID))
@@ -212,6 +215,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
                 // Отменяем отложенное убийство процесса (см. ACTION_TOGGLE): частые
                 // переподключения попадали ровно в это окно, и старт терялся вместе с процессом.
                 mainHandler.removeCallbacks(killProcessRunnable)
+                deadTunnelReconnectCounter.reset()
                 // startForegroundService обязывает вызвать startForeground в течение 5 с. Поэтому
                 // поднимаем уведомление сразу, ДО любых проверок (VPN-разрешение, ядро, профиль):
                 // иначе ранний fail() даёт ForegroundServiceDidNotStartInTimeException.
@@ -344,7 +348,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
     private var watchdogFailures = 0
     private var awgDeadChecks = 0
     private var probingTunnel = false
-    private var deadTunnelReconnectAttempts = 0
+    private val deadTunnelReconnectCounter = DeadTunnelReconnectCounter(DEAD_RECONNECT_MAX)
 
     private val tunnelWatchdog = object : Runnable {
         override fun run() {
@@ -361,7 +365,6 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         watchdogProfile = profile
         watchdogFailures = 0
         awgDeadChecks = 0
-        deadTunnelReconnectAttempts = 0
         mainHandler.removeCallbacks(tunnelWatchdog)
         mainHandler.postDelayed(tunnelWatchdog, TUNNEL_WATCHDOG_INTERVAL_MS)
     }
@@ -392,6 +395,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         } else {
             if (awgDeadChecks > 0) AppLog.i(TAG, "dead-tunnel: handshake обновлён, счётчик сброшен")
             awgDeadChecks = 0
+            deadTunnelReconnectCounter.reset()
         }
     }
 
@@ -434,6 +438,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
                 if (ok) {
                     if (watchdogFailures > 0) AppLog.i(TAG, "dead-tunnel: прокси снова отвечает, счётчик сброшен")
                     watchdogFailures = 0
+                    deadTunnelReconnectCounter.reset()
                 } else {
                     watchdogFailures++
                     AppLog.e(TAG, "dead-tunnel: проба через туннель не прошла ($watchdogFailures/$TUNNEL_WATCHDOG_FAILURE_LIMIT)")
@@ -455,11 +460,9 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         }
     }.getOrNull()
 
-    /** Мёртвый туннель: закрываем ядро и ВМЕСТО тупого ERROR пытаемся переподключиться
-     *  сами (до [DEAD_RECONNECT_MAX] попыток с нарастающей паузой). Успешный старт сбрасывает
-     *  счётчик (armTunnelWatchdog). Попытки кончились — ERROR уже с финальным текстом и
-     *  процесс гасим как раньше. proxyWasActive НЕ сбрасываем: при следующем запуске
-     *  приложения попробуем подняться снова. */
+    /** Мёртвый туннель: закрываем ядро и пытаемся переподключиться не более
+     *  [DEAD_RECONNECT_MAX] раз подряд. Бюджет сбрасывает только успешная проба живого
+     *  туннеля или новый явный старт от пользователя, но не сам запуск ядра. */
     private fun deadTunnel(reason: String) {
         AppLog.e(TAG, "dead-tunnel: $reason")
         if (!stopping.compareAndSet(false, true)) return
@@ -467,13 +470,13 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         stateStore.update(ConnectionState.ERROR, reason)
         teardownInBackground("dead-tunnel") { closed ->
             AppLog.i(TAG, "dead-tunnel: ядро закрыто (успешно=$closed)")
-            if (closed && deadTunnelReconnectAttempts < DEAD_RECONNECT_MAX) {
-                deadTunnelReconnectAttempts++
-                val delayMs = DEAD_RECONNECT_BASE_DELAY_MS * deadTunnelReconnectAttempts
-                AppLog.i(TAG, "dead-tunnel: автопереподключение ${deadTunnelReconnectAttempts}/$DEAD_RECONNECT_MAX через ${delayMs}мс")
+            val attempt = if (closed) deadTunnelReconnectCounter.nextAttemptOrNull() else null
+            if (attempt != null) {
+                val delayMs = DEAD_RECONNECT_BASE_DELAY_MS * attempt
+                AppLog.i(TAG, "dead-tunnel: автопереподключение $attempt/$DEAD_RECONNECT_MAX через ${delayMs}мс")
                 stateStore.update(
                     ConnectionState.STARTING,
-                    "Сервер перестал отвечать. Переподключение (${deadTunnelReconnectAttempts}/$DEAD_RECONNECT_MAX)…",
+                    "Сервер перестал отвечать. Переподключение ($attempt/$DEAD_RECONNECT_MAX)…",
                 )
                 stopping.set(false)
                 mainHandler.postDelayed({
@@ -621,22 +624,24 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
             selectedAppsOnly = profileStore.selectedAppsOnly,
             directPackages = profileStore.directAppPackages,
             routeRules = rules,
+            tunMtu = profileStore.tunMtu,
         )
         val basePath = filesDir.absolutePath
         ensureLibboxReady(basePath)
         AppLog.i(TAG, "startSingBox: конфиг (секреты скрыты) ${SingBoxConfigBuilder.redactForLog(config)}")
-        // Предстартовая проверка: понятная причина ошибки вместо нативного падения при newService.
+        // Предстартовая проверка: понятная причина ошибки вместо нативного падения при запуске.
         try {
             Libbox.checkConfig(config)
         } catch (error: Exception) {
             throw IllegalStateException("Конфигурация отклонена ядром sing-box: ${error.message}", error)
         }
-        AppLog.i(TAG, "startSingBox: Libbox.newService…")
-        val service = Libbox.newService(config, this)
+        AppLog.i(TAG, "startSingBox: Libbox.newCommandServer…")
+        val service = Libbox.newCommandServer(LibboxCommandServerHandler(), this)
         boxService = service
-        AppLog.i(TAG, "startSingBox: service.start()…")
+        AppLog.i(TAG, "startSingBox: CommandServer.start()…")
         service.start()
-        AppLog.i(TAG, "startSingBox: service.start() завершён")
+        service.startOrReloadService(config, OverrideOptions())
+        AppLog.i(TAG, "startSingBox: CommandServer запущен")
     }
 
     private fun ensureLibboxReady(basePath: String) {
@@ -644,7 +649,14 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         synchronized(VibeTunVpnService::class.java) {
             if (libboxReady) return
             AppLog.i(TAG, "startSingBox: Libbox.setup(basePath=$basePath, однократно)")
-            Libbox.setup(basePath, basePath, cacheDir.absolutePath, false)
+            Libbox.setup(SetupOptions().apply {
+                this.basePath = basePath
+                workingPath = basePath
+                tempPath = cacheDir.absolutePath
+                fixAndroidStack = false
+                logMaxLines = 3000
+                debug = false
+            })
             libboxReady = true
         }
     }
@@ -1014,12 +1026,20 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
             boxService = null
             if (currentBoxService != null) {
                 val startedAt = SystemClock.elapsedRealtime()
+                // В sing-box 1.14 close() закрывает только CommandServer. Сам BoxService
+                // останавливается отдельно; иначе старое ядро продолжает держать cache.db и TUN.
+                runCatching { currentBoxService.closeService() }
+                    .onFailure {
+                        success = false
+                        AppLog.e(TAG, "close: ошибка boxService.closeService()", it)
+                        Log.w(TAG, "Error while stopping sing-box service", it)
+                    }
                 runCatching { currentBoxService.close() }
-                    .onSuccess { AppLog.i(TAG, "close: boxService.close() завершён за ${SystemClock.elapsedRealtime() - startedAt}мс") }
+                    .onSuccess { AppLog.i(TAG, "close: ядро и CommandServer закрыты за ${SystemClock.elapsedRealtime() - startedAt}мс") }
                     .onFailure {
                         success = false
                         AppLog.e(TAG, "close: ошибка boxService.close()", it)
-                        Log.w(TAG, "Error while stopping sing-box", it)
+                        Log.w(TAG, "Error while closing sing-box command server", it)
                     }
             }
 
@@ -1080,7 +1100,12 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         }
 
         if (options.autoRoute) {
-            options.dnsServerAddress.takeIf { it.isNotBlank() }?.let(builder::addDnsServer)
+            if (options.dnsMode.value != Libbox.DNSModeDisabled) {
+                val dnsServerAddress = options.dnsServerAddress
+                while (dnsServerAddress.hasNext()) {
+                    builder.addDnsServer(dnsServerAddress.next())
+                }
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 addConfiguredRoutes(builder, options.inet4RouteAddress, "0.0.0.0", hasInet4)
                 addConfiguredRoutes(builder, options.inet6RouteAddress, "::", hasInet6)
@@ -1165,15 +1190,13 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         }
     }
 
-    override fun useProcFS(): Boolean = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
-
     override fun findConnectionOwner(
         ipProtocol: Int,
         sourceAddress: String?,
         sourcePort: Int,
         destinationAddress: String?,
         destinationPort: Int,
-    ): Int {
+    ): ConnectionOwner {
         check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) { "Connection-owner lookup requires Android 10 or newer." }
         val uid = connectivity.getConnectionOwnerUid(
             ipProtocol,
@@ -1181,25 +1204,13 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
             InetSocketAddress(destinationAddress.orEmpty(), destinationPort),
         )
         check(uid >= 0) { "Android could not identify the connection owner." }
-        return uid
-    }
-
-    override fun packageNameByUid(uid: Int): String {
-        return packageManager.getPackagesForUid(uid)?.firstOrNull().orEmpty()
-    }
-
-    override fun uidByPackageName(packageName: String?): Int {
-        val name = packageName?.takeIf { it.isNotBlank() } ?: error("Package name is empty.")
-        val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            packageManager.getApplicationInfo(name, PackageManager.ApplicationInfoFlags.of(0))
-        } else {
-            @Suppress("DEPRECATION")
-            packageManager.getApplicationInfo(name, 0)
+        val packages = packageManager.getPackagesForUid(uid).orEmpty().toList()
+        return ConnectionOwner().apply {
+            userId = uid
+            userName = packages.firstOrNull().orEmpty()
+            setAndroidPackageNames(StringIteratorImpl(packages))
         }
-        return info.uid
     }
-
-    override fun usePlatformDefaultInterfaceMonitor(): Boolean = true
 
     override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {
         if (interfaceCallbacks.containsKey(listener)) return
@@ -1210,7 +1221,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
 
             override fun onLost(network: Network) {
                 val active = connectivity.activeNetwork
-                if (active == null || active == network) listener.updateDefaultInterface("", -1)
+                if (active == null || active == network) listener.updateDefaultInterface("", -1, false, false)
             }
         }
         interfaceCallbacks[listener] = callback
@@ -1239,7 +1250,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
         if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) {
             AppLog.i(TAG, "publishDefaultNetwork: собственный VPN-интерфейс — сохраняем $lastRealInterfaceName")
             if (lastRealInterfaceName.isNotBlank()) {
-                listener.updateDefaultInterface(lastRealInterfaceName, lastRealInterfaceIndex)
+                listener.updateDefaultInterface(lastRealInterfaceName, lastRealInterfaceIndex, false, false)
             }
             return
         }
@@ -1249,10 +1260,8 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
             lastRealInterfaceName = name
             lastRealInterfaceIndex = index
         }
-        listener.updateDefaultInterface(name, index)
+        listener.updateDefaultInterface(name, index, false, false)
     }
-
-    override fun usePlatformInterfaceGetter(): Boolean = true
 
     override fun getInterfaces(): LibboxNetworkInterfaceIterator {
         val interfaces = runCatching { Collections.list(JavaNetworkInterface.getNetworkInterfaces()) }
@@ -1263,12 +1272,20 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
                         index = networkInterface.index
                         name = networkInterface.name
                         mtu = networkInterface.mtu
+                        type = Libbox.InterfaceTypeOther
+                        flags = (if (networkInterface.isUp) OsConstants.IFF_UP else 0) or
+                            (if (networkInterface.isLoopback) OsConstants.IFF_LOOPBACK else 0) or
+                            (if (networkInterface.isPointToPoint) OsConstants.IFF_POINTOPOINT else 0) or
+                            (if (networkInterface.supportsMulticast()) OsConstants.IFF_MULTICAST else 0)
+                        metered = false
                         addresses = StringIteratorImpl(
                             networkInterface.interfaceAddresses.mapNotNull { interfaceAddress ->
                                 val address = interfaceAddress.address?.hostAddress?.substringBefore('%') ?: return@mapNotNull null
                                 "$address/${interfaceAddress.networkPrefixLength.toInt()}"
                             },
                         )
+                        dnsServer = StringIteratorImpl(emptyList())
+                        gateway = StringIteratorImpl(emptyList())
                     }
                 }.getOrNull()
             }
@@ -1283,17 +1300,6 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
 
     override fun clearDNSCache() {
         // The Android resolver owns the system DNS cache; the core creates fresh upstream sessions.
-    }
-
-    override fun writeLog(message: String?) {
-        val line = message?.trim().orEmpty()
-        if (line.isEmpty()) return
-        // debug/trace уровни — только в файл ядра (logs/core.log), иначе AppLog превратится в кашу.
-        // Уровень приходит с ANSI-кодами вида «[36mINFO[0m[0000]», поэтому сначала снимаем их.
-        val plain = line.replace(Regex("\u001B\\[[;\\d]*m"), "")
-        if (plain.startsWith("DEBUG") || plain.startsWith("TRACE")) return
-        Log.i(TAG, plain)
-        AppLog.i("Core", plain)
     }
 
     override fun onRevoke() {
@@ -1370,6 +1376,7 @@ open class VibeTunVpnService : VpnService(), PlatformInterface {
 
     private class StringIteratorImpl(values: List<String>) : StringIterator {
         private val iterator = values.iterator()
+        override fun len(): Int = 0
         override fun hasNext(): Boolean = iterator.hasNext()
         override fun next(): String = iterator.next()
     }

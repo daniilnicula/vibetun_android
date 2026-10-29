@@ -18,6 +18,7 @@
 | Type           | Format                         |
 |----------------|--------------------------------|
 | `direct`       | [Direct](./direct/)             |
+| `bridge`       | [Bridge](./bridge/)             |
 | `block`        | [Block](./block/)               |
 | `socks`        | [SOCKS](./socks/)               |
 | `http`         | [HTTP](./http/)                 |
@@ -30,11 +31,14 @@
 | `shadowtls`    | [ShadowTLS](./shadowtls/)       |
 | `tuic`         | [TUIC](./tuic/)                 |
 | `hysteria2`    | [Hysteria2](./hysteria2/)       |
+| `anytls`       | [AnyTLS](./anytls/)             |
+| `snell`        | [Snell](./snell/)               |
 | `tor`          | [Tor](./tor/)                   |
 | `ssh`          | [SSH](./ssh/)                   |
 | `dns`          | [DNS](./dns/)                   |
 | `selector`     | [Selector](./selector/)         |
 | `urltest`      | [URLTest](./urltest/)           |
+| `naive`        | [NaiveProxy](./naive/)          |
 
 #### tag
 

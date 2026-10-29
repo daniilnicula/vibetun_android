@@ -1,6 +1,6 @@
 //go:build go1.20
 
-package boxmain
+package main
 
 import (
 	"crypto/ecdh"

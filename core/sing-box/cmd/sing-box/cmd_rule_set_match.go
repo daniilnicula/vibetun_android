@@ -1,19 +1,22 @@
-package boxmain
+package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/srs"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/route"
+	"github.com/sagernet/sing-box/route/rule"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json"
+	M "github.com/sagernet/sing/common/metadata"
 
 	"github.com/spf13/cobra"
 )
@@ -21,8 +24,8 @@ import (
 var flagRuleSetMatchFormat string
 
 var commandRuleSetMatch = &cobra.Command{
-	Use:   "match <rule-set path> <domain>",
-	Short: "Check if a domain matches the rule set",
+	Use:   "match <rule-set path> <IP address/domain>",
+	Short: "Check if an IP address or a domain matches the rule-set",
 	Args:  cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
 		err := ruleSetMatch(args[0], args[1])
@@ -54,32 +57,47 @@ func ruleSetMatch(sourcePath string, domain string) error {
 	if err != nil {
 		return E.Cause(err, "read rule-set")
 	}
-	var plainRuleSet option.PlainRuleSet
+	if flagRuleSetMatchFormat == "" {
+		switch filepath.Ext(sourcePath) {
+		case ".json":
+			flagRuleSetMatchFormat = C.RuleSetFormatSource
+		case ".srs":
+			flagRuleSetMatchFormat = C.RuleSetFormatBinary
+		}
+	}
+	var ruleSet option.PlainRuleSetCompat
 	switch flagRuleSetMatchFormat {
 	case C.RuleSetFormatSource:
-		var compat option.PlainRuleSetCompat
-		compat, err = json.UnmarshalExtended[option.PlainRuleSetCompat](content)
+		ruleSet, err = json.UnmarshalExtended[option.PlainRuleSetCompat](content)
 		if err != nil {
 			return err
 		}
-		plainRuleSet = compat.Upgrade()
 	case C.RuleSetFormatBinary:
-		plainRuleSet, err = srs.Read(bytes.NewReader(content), false)
+		ruleSet, err = srs.Read(bytes.NewReader(content), false)
 		if err != nil {
 			return err
 		}
 	default:
-		return E.New("unknown rule set format: ", flagRuleSetMatchFormat)
+		return E.New("unknown rule-set format: ", flagRuleSetMatchFormat)
+	}
+	plainRuleSet, err := ruleSet.Upgrade()
+	if err != nil {
+		return err
+	}
+	ipAddress := M.ParseAddr(domain)
+	var metadata adapter.InboundContext
+	if ipAddress.IsValid() {
+		metadata.Destination = M.SocksaddrFrom(ipAddress, 0)
+	} else {
+		metadata.Domain = domain
 	}
 	for i, ruleOptions := range plainRuleSet.Rules {
 		var currentRule adapter.HeadlessRule
-		currentRule, err = route.NewHeadlessRule(nil, ruleOptions)
+		currentRule, err = rule.NewHeadlessRule(context.Background(), ruleOptions)
 		if err != nil {
 			return E.Cause(err, "parse rule_set.rules.[", i, "]")
 		}
-		if currentRule.Match(&adapter.InboundContext{
-			Domain: domain,
-		}) {
+		if currentRule.Match(&metadata) {
 			println(F.ToString("match rules.[", i, "]: ", currentRule))
 		}
 	}

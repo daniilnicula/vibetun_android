@@ -1,4 +1,4 @@
-package boxmain
+package main
 
 import (
 	"context"
@@ -7,8 +7,11 @@ import (
 	"strconv"
 	"time"
 
-	_ "github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/experimental/deprecated"
+	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 
 	"github.com/spf13/cobra"
@@ -50,7 +53,9 @@ func preRun(cmd *cobra.Command, args []string) {
 		globalCtx = filemanager.WithDefault(globalCtx, "", "", sudoUID, sudoGID)
 	}
 	if disableColor {
-		log.SetStdLogger(log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now(), DisableColors: true}, os.Stderr, "", nil, false).Logger())
+		logFactory := log.NewDefaultFactory(context.Background(), log.Formatter{BaseTime: time.Now(), DisableColors: true}, os.Stderr, "", nil, false)
+		common.Must(logFactory.Start())
+		log.SetStdLogger(logFactory.Logger())
 	}
 	if workingDir != "" {
 		_, err := os.Stat(workingDir)
@@ -65,4 +70,5 @@ func preRun(cmd *cobra.Command, args []string) {
 	if len(configPaths) == 0 && len(configDirectories) == 0 {
 		configPaths = append(configPaths, "config.json")
 	}
+	globalCtx = include.Context(service.ContextWith(globalCtx, deprecated.NewStderrManager(log.StdLogger())))
 }

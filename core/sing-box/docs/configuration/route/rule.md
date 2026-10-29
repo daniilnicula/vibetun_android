@@ -1,3 +1,36 @@
+---
+icon: material/new-box
+---
+
+!!! quote "Changes in sing-box 1.14.0"
+
+    :material-plus: [source_mac_address](#source_mac_address)  
+    :material-plus: [source_hostname](#source_hostname)  
+    :material-plus: [package_name_regex](#package_name_regex)
+
+!!! quote "Changes in sing-box 1.13.0"
+
+    :material-plus: [interface_address](#interface_address)  
+    :material-plus: [network_interface_address](#network_interface_address)  
+    :material-plus: [default_interface_address](#default_interface_address)  
+    :material-plus: [preferred_by](#preferred_by)  
+    :material-alert: [network](#network)
+
+!!! quote "Changes in sing-box 1.11.0"
+
+    :material-plus: [action](#action)  
+    :material-alert: [outbound](#outbound)  
+    :material-plus: [network_type](#network_type)  
+    :material-plus: [network_is_expensive](#network_is_expensive)  
+    :material-plus: [network_is_constrained](#network_is_constrained)
+
+!!! quote "Changes in sing-box 1.10.0"
+
+    :material-plus: [client](#client)  
+    :material-delete-clock: [rule_set_ipcidr_match_source](#rule_set_ipcidr_match_source)  
+    :material-plus: [rule_set_ip_cidr_match_source](#rule_set_ip_cidr_match_source)  
+    :material-plus: [process_path_regex](#process_path_regex)
+
 !!! quote "Changes in sing-box 1.8.0"
 
     :material-plus: [rule_set](#rule_set)  
@@ -30,6 +63,12 @@
           "tls",
           "http",
           "quic"
+        ],
+        "client": [
+          "chromium",
+          "safari",
+          "firefox",
+          "quic-go"
         ],
         "domain": [
           "test.com"
@@ -85,8 +124,14 @@
         "process_path": [
           "/usr/bin/curl"
         ],
+        "process_path_regex": [
+          "^/usr/bin/.+"
+        ],
         "package_name": [
           "com.termux"
+        ],
+        "package_name_regex": [
+          "^com\\.termux.*"
         ],
         "user": [
           "sekai"
@@ -95,18 +140,49 @@
           1000
         ],
         "clash_mode": "direct",
+        "network_type": [
+          "wifi"
+        ],
+        "network_is_expensive": false,
+        "network_is_constrained": false,
+        "interface_address": {
+          "en0": [
+            "2000::/3"
+          ]
+        },
+        "network_interface_address": {
+          "wifi": [
+            "2000::/3"
+          ]
+        },
+        "default_interface_address": [
+          "2000::/3"
+        ],
         "wifi_ssid": [
           "My WIFI"
         ],
         "wifi_bssid": [
           "00:00:00:00:00:00"
         ],
+        "preferred_by": [
+          "tailscale",
+          "wireguard"
+        ],
+        "source_mac_address": [
+          "00:11:22:33:44:55"
+        ],
+        "source_hostname": [
+          "my-device"
+        ],
         "rule_set": [
           "geoip-cn",
           "geosite-cn"
         ],
+        // deprecated
         "rule_set_ipcidr_match_source": false,
+        "rule_set_ip_cidr_match_source": false,
         "invert": false,
+        "action": "route",
         "outbound": "direct"
       },
       {
@@ -114,6 +190,7 @@
         "mode": "and",
         "rules": [],
         "invert": false,
+        "action": "route",
         "outbound": "direct"
       }
     ]
@@ -137,7 +214,7 @@
     (`source_port` || `source_port_range`) &&  
     `other fields`
 
-    Additionally, included rule sets can be considered merged rather than as a single rule sub-item.
+    When a rule-set contains only a single default rule without `invert`, its fields are considered merged into the outer rule per the logic above; otherwise, it is matched as an `other field`; different rule-sets always keep OR semantics.
 
 #### inbound
 
@@ -155,11 +232,25 @@ Username, see each inbound for details.
 
 #### protocol
 
-Sniffed protocol, see [Sniff](/configuration/route/sniff/) for details.
+Sniffed protocol, see [Protocol Sniff](/configuration/route/sniff/) for details.
+
+#### client
+
+!!! question "Since sing-box 1.10.0"
+
+Sniffed client type, see [Protocol Sniff](/configuration/route/sniff/) for details.
 
 #### network
 
-`tcp` or `udp`.
+!!! quote "Changes in sing-box 1.13.0"
+
+    Since sing-box 1.13.0, you can match ICMP echo (ping) requests via the new `icmp` network.
+    
+    Such traffic originates from `TUN`, `WireGuard`, and `Tailscale` inbounds and can be routed to `Direct`, `WireGuard`, and `Tailscale` outbounds.
+
+Match network type.
+
+`tcp`, `udp` or `icmp`.
 
 #### domain
 
@@ -181,7 +272,7 @@ Match domain using regular expression.
 
 !!! failure "Deprecated in sing-box 1.8.0"
 
-    Geosite is deprecated and may be removed in the future, check [Migration](/migration/#migrate-geosite-to-rule-sets).
+    Geosite is deprecated and will be removed in sing-box 1.12.0, check [Migration](/migration/#migrate-geosite-to-rule-sets).
 
 Match geosite.
 
@@ -189,7 +280,7 @@ Match geosite.
 
 !!! failure "Deprecated in sing-box 1.8.0"
 
-    GeoIP is deprecated and may be removed in the future, check [Migration](/migration/#migrate-geoip-to-rule-sets).
+    GeoIP is deprecated and will be removed in sing-box 1.12.0, check [Migration](/migration/#migrate-geoip-to-rule-sets).
 
 Match source geoip.
 
@@ -197,7 +288,7 @@ Match source geoip.
 
 !!! failure "Deprecated in sing-box 1.8.0"
 
-    GeoIP is deprecated and may be removed in the future, check [Migration](/migration/#migrate-geoip-to-rule-sets).
+    GeoIP is deprecated and will be removed in sing-box 1.12.0, check [Migration](/migration/#migrate-geoip-to-rule-sets).
 
 Match geoip.
 
@@ -253,9 +344,25 @@ Match process name.
 
 Match process path.
 
+#### process_path_regex
+
+!!! question "Since sing-box 1.10.0"
+
+!!! quote ""
+
+    Only supported on Linux, Windows, and macOS.
+
+Match process path using regular expression.
+
 #### package_name
 
 Match android package name.
+
+#### package_name_regex
+
+!!! question "Since sing-box 1.14.0"
+
+Match android package name using regular expression.
 
 #### user
 
@@ -277,43 +384,150 @@ Match user id.
 
 Match Clash mode.
 
-#### wifi_ssid
+#### network_type
+
+!!! question "Since sing-box 1.11.0"
 
 !!! quote ""
 
     Only supported in graphical clients on Android and Apple platforms.
+
+Match network type.
+
+Available values: `wifi`, `cellular`, `ethernet` and `other`.
+
+#### network_is_expensive
+
+!!! question "Since sing-box 1.11.0"
+
+!!! quote ""
+
+    Only supported in graphical clients on Android and Apple platforms.
+
+Match if network is considered Metered (on Android) or considered expensive,
+such as Cellular or a Personal Hotspot (on Apple platforms).
+
+#### network_is_constrained
+
+!!! question "Since sing-box 1.11.0"
+
+!!! quote ""
+
+    Only supported in graphical clients on Apple platforms.
+
+Match if network is in Low Data Mode.
+
+#### interface_address
+
+!!! question "Since sing-box 1.13.0"
+
+!!! quote ""
+
+    Only supported on Linux, Windows, and macOS.
+
+Match interface address.
+
+#### network_interface_address
+
+!!! question "Since sing-box 1.13.0"
+
+!!! quote ""
+
+    Only supported in graphical clients on Android and Apple platforms.
+
+Matches network interface (same values as `network_type`) address.
+
+#### default_interface_address
+
+!!! question "Since sing-box 1.13.0"
+
+!!! quote ""
+
+    Only supported on Linux, Windows, and macOS.
+
+Match default interface address.
+
+#### wifi_ssid
 
 Match WiFi SSID.
 
+See [Wi-Fi State](/configuration/shared/wifi-state/) for details.
+
 #### wifi_bssid
+
+Match WiFi BSSID.
+
+See [Wi-Fi State](/configuration/shared/wifi-state/) for details.
+
+#### preferred_by
+
+!!! question "Since sing-box 1.13.0"
+
+Match specified outbounds' preferred routes.
+
+| Type        | Match                                              |
+|-------------|----------------------------------------------------|
+| `tailscale` | Match MagicDNS domains and peers' allowed IPs      |
+| `wireguard` | Match peers's allowed IPs                          |
+| `bridge`    | Match all addresses except local addresses of the machine, only in [pre-match](/configuration/shared/pre-match/) |
+
+#### source_mac_address
+
+!!! question "Since sing-box 1.14.0"
 
 !!! quote ""
 
-    Only supported in graphical clients on Android and Apple platforms.
+    Only supported on Linux, macOS, or in graphical clients on Android and macOS. See [Neighbor Resolution](/configuration/shared/neighbor/) for setup.
 
-Match WiFi BSSID.
+Match source device MAC address.
+
+#### source_hostname
+
+!!! question "Since sing-box 1.14.0"
+
+!!! quote ""
+
+    Only supported on Linux, macOS, or in graphical clients on Android and macOS. See [Neighbor Resolution](/configuration/shared/neighbor/) for setup.
+
+Match source device hostname from DHCP leases.
 
 #### rule_set
 
 !!! question "Since sing-box 1.8.0"
 
-Match [Rule Set](/configuration/route/#rule_set).
+Match [rule-set](/configuration/route/#rule_set).
 
 #### rule_set_ipcidr_match_source
 
 !!! question "Since sing-box 1.8.0"
 
-Make `ipcidr` in rule sets match the source IP.
+!!! failure "Deprecated in sing-box 1.10.0"
+
+    `rule_set_ipcidr_match_source` is renamed to `rule_set_ip_cidr_match_source` and will be remove in sing-box 1.11.0.
+
+Make `ip_cidr` in rule-sets match the source IP.
+
+#### rule_set_ip_cidr_match_source
+
+!!! question "Since sing-box 1.10.0"
+
+Make `ip_cidr` in rule-sets match the source IP.
 
 #### invert
 
 Invert match result.
 
-#### outbound
+#### action
 
 ==Required==
 
-Tag of the target outbound.
+See [Rule Actions](../rule_action/) for details.
+
+#### outbound
+
+!!! failure "Deprecated in sing-box 1.11.0"
+
+    Moved to [Rule Action](../rule_action#route).
 
 ### Logical Fields
 

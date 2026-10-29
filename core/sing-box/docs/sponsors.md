@@ -11,16 +11,16 @@ the project maintainer via [GitHub Sponsors](https://github.com/sponsors/nekohas
 
 ![](https://nekohasekai.github.io/sponsor-images/sponsors.svg)
 
-### Special Sponsors
+## Special Sponsors
 
-**Viral Tech, Inc.**
+> Viral Tech, Inc.
 
 Helping us re-list sing-box apps on the Apple Store.
 
 ---
 
-[![JetBrains logo](https://resources.jetbrains.com/storage/products/company/brand/logos/jetbrains.svg)](https://www.jetbrains.com)
+> [JetBrains](https://www.jetbrains.com)
 
 Free license for the amazing IDEs.
 
----
+[![JetBrains logo](https://resources.jetbrains.com/storage/products/company/brand/logos/jetbrains.svg)](https://www.jetbrains.com)

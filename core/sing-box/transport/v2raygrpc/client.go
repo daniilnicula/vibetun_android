@@ -4,12 +4,12 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
@@ -29,7 +29,7 @@ type Client struct {
 	serverAddr  string
 	serviceName string
 	dialOptions []grpc.DialOption
-	conn        *grpc.ClientConn
+	conn        atomic.Pointer[grpc.ClientConn]
 	connAccess  sync.Mutex
 }
 
@@ -40,6 +40,9 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 			tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
 		}
 		dialOptions = append(dialOptions, grpc.WithTransportCredentials(NewTLSTransportCredentials(tlsConfig)))
+		if tlsConfig.ServerName() != "" {
+			dialOptions = append(dialOptions, grpc.WithAuthority(tlsConfig.ServerName()))
+		}
 	} else {
 		dialOptions = append(dialOptions, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
@@ -62,6 +65,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	dialOptions = append(dialOptions, grpc.WithContextDialer(func(ctx context.Context, server string) (net.Conn, error) {
 		return dialer.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr(server))
 	}))
+	//nolint:staticcheck
 	dialOptions = append(dialOptions, grpc.WithReturnConnectionError())
 	return &Client{
 		ctx:         ctx,
@@ -73,23 +77,22 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 }
 
 func (c *Client) connect() (*grpc.ClientConn, error) {
-	conn := c.conn
+	conn := c.conn.Load()
 	if conn != nil && conn.GetState() != connectivity.Shutdown {
 		return conn, nil
 	}
 	c.connAccess.Lock()
 	defer c.connAccess.Unlock()
-	conn = c.conn
+	conn = c.conn.Load()
 	if conn != nil && conn.GetState() != connectivity.Shutdown {
 		return conn, nil
 	}
 	//nolint:staticcheck
-	//goland:noinspection GoDeprecation
 	conn, err := grpc.DialContext(c.ctx, c.serverAddr, c.dialOptions...)
 	if err != nil {
 		return nil, err
 	}
-	c.conn = conn
+	c.conn.Store(conn)
 	return conn, nil
 }
 
@@ -99,21 +102,26 @@ func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 		return nil, err
 	}
 	client := NewGunServiceClient(clientConn).(GunServiceCustomNameClient)
-	ctx, cancel := common.ContextWithCancelCause(ctx)
-	stream, err := client.TunCustomName(ctx, c.serviceName)
+	streamCtx, cancel := context.WithCancelCause(context.WithoutCancel(ctx))
+	stopPropagation := context.AfterFunc(ctx, func() {
+		cancel(context.Cause(ctx))
+	})
+	stream, err := client.TunCustomName(streamCtx, c.serviceName)
 	if err != nil {
+		stopPropagation()
 		cancel(err)
 		return nil, err
+	}
+	if !stopPropagation() {
+		return nil, context.Cause(ctx)
 	}
 	return NewGRPCConn(stream, cancel), nil
 }
 
 func (c *Client) Close() error {
-	c.connAccess.Lock()
-	defer c.connAccess.Unlock()
-	if c.conn != nil {
-		c.conn.Close()
-		c.conn = nil
+	conn := c.conn.Swap(nil)
+	if conn != nil {
+		conn.Close()
 	}
 	return nil
 }

@@ -38,6 +38,8 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         private set
     var launchAtBoot by mutableStateOf(store.launchAtBoot)
         private set
+    var tunMtu by mutableStateOf(store.tunMtu)
+        private set
 
     // ==================== обновления ====================
     var updateChecking by mutableStateOf(false)
@@ -85,6 +87,25 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
     var pingingAll by mutableStateOf(false)
         private set
 
+    /** Подписки: каждая — отдельная группа профилей со своей ссылкой. */
+    val subscriptions = mutableStateListOf<Subscription>()
+
+    /** Id подписки, которая сейчас обновляется (значок «обновить» в заголовке группы). */
+    var subscriptionRefreshingId by mutableStateOf<String?>(null)
+        private set
+
+    /** Показывать ли системные приложения (без иконки запуска) в списке маршрутизации. */
+    var showSystemApps by mutableStateOf(false)
+        private set
+
+    /** Трафик через VPN-интерфейс (обновляется опросом из UI). */
+    var traffic by mutableStateOf<TrafficSnapshot?>(null)
+        private set
+
+    /** Момент начала текущего сеанса (мс epoch); 0 — сеанса нет. */
+    var sessionStartedAtMs by mutableStateOf(0L)
+        private set
+
     /** Наборы правил маршрутизации (отдельные json-файлы, как routes\ в Windows). */
     var routeSetNames by mutableStateOf(listOf<String>())
         private set
@@ -100,6 +121,7 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         profiles.addAll(store.loadProfiles())
+        subscriptions.addAll(store.loadSubscriptions())
         if (profiles.none { it.id == selectedProfileId }) {
             selectedProfileId = profiles.firstOrNull()?.id.orEmpty()
             store.selectedProfileId = selectedProfileId
@@ -122,6 +144,19 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
                 .filter { query.isEmpty() || it.name.contains(query, true) || it.server.contains(query, true) || it.protocolLabel.contains(query, true) }
                 .sortedWith(compareByDescending<ProxyProfile> { it.favorite }.thenBy { it.name.lowercase() })
         }
+
+    /**
+     * Группы профилей для списка серверов: сначала подписки (каждая — со своим
+     * заголовком и значком обновления), затем группы одного адреса для остальных
+     * профилей — как в Windows-версии VibeTun.
+     */
+    val profileGroups: List<ProfileGroup>
+        get() = buildProfileGroups(visibleProfiles, subscriptions.toList())
+
+    /** Замер задержки сразу для всех профилей группы (кнопка у заголовка группы). */
+    fun pingGroup(group: ProfileGroup) {
+        group.profiles.forEach { profile -> pingProfile(profile.id) }
+    }
 
     val isConnecting: Boolean
         get() = connectionState == ConnectionState.STARTING
@@ -166,35 +201,91 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
             (trimmed.startsWith("https://") || trimmed.startsWith("http://"))
     }
 
-    /** Загрузка подписки и добавление распарсенных профилей (без дублей по source). */
+    /**
+     * Загрузка подписки: создаёт (или обновляет) группу подписки и наполняет её
+     * профилями из выгрузки.
+     */
     fun fetchSubscription(url: String, allowInsecure: Boolean) {
         if (subscriptionLoading) return
         subscriptionLoading = true
         subscriptionError = null
         viewModelScope.launch {
             runCatching { withContext(Dispatchers.IO) { SubscriptionFetcher.fetch(url, allowInsecure) } }
-                .onSuccess { payload ->
-                    val result = ProfileLinkParser.parseMany(payload)
-                    if (result.profiles.isEmpty()) {
-                        subscriptionError = "В подписке не найдено поддерживаемых профилей."
-                        return@onSuccess
-                    }
-                    val existingSources = profiles.map { it.source }.toSet()
-                    val newProfiles = result.profiles.filterNot { it.source in existingSources }
-                    profiles.addAll(newProfiles)
-                    if (selectedProfileId.isBlank() && profiles.isNotEmpty()) selectProfile(profiles.first().id)
-                    persistProfiles()
-                    val skipped = result.profiles.size - newProfiles.size
-                    feedback = if (skipped > 0) {
-                        "Добавлено из подписки: ${newProfiles.size} (дублей пропущено: $skipped)"
-                    } else {
-                        "Добавлено из подписки: ${newProfiles.size}"
-                    }
-                    pendingSubscriptionUrl = null
-                }
+                .onSuccess { payload -> applySubscriptionPayload(url, allowInsecure, payload) }
                 .onFailure { subscriptionError = "Не удалось загрузить подписку: ${it.message}" }
             subscriptionLoading = false
         }
+    }
+
+    /**
+     * Обновление подписки по значку в заголовке группы: перекачиваем ссылку и
+     * обновляем конфиги внутри группы (новые — добавляем, изменившиеся — обновляем,
+     * исчезнувшие — убираем).
+     */
+    fun refreshSubscription(subscription: Subscription) {
+        if (subscriptionRefreshingId != null) return
+        subscriptionRefreshingId = subscription.id
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) { SubscriptionFetcher.fetch(subscription.url, subscription.allowInsecure) }
+            }
+                .onSuccess { payload -> applySubscriptionPayload(subscription.url, subscription.allowInsecure, payload) }
+                .onFailure { feedback = "Не удалось обновить подписку: ${it.message}" }
+            subscriptionRefreshingId = null
+        }
+    }
+
+    /** Переименование группы подписки. */
+    fun renameSubscription(subscription: Subscription, name: String) {
+        val index = subscriptions.indexOfFirst { it.id == subscription.id }
+        if (index < 0) return
+        val trimmed = name.trim()
+        if (trimmed.isBlank()) return
+        subscriptions[index] = subscriptions[index].copy(name = trimmed)
+        persistSubscriptions()
+        feedback = "Подписка переименована"
+    }
+
+    /** Удаление подписки вместе с её профилями. */
+    fun removeSubscription(subscription: Subscription) {
+        val ids = subscription.profileIds.toSet()
+        profiles.removeAll { it.id in ids }
+        subscriptions.removeAll { it.id == subscription.id }
+        if (selectedProfileId in ids) {
+            selectedProfileId = profiles.firstOrNull()?.id.orEmpty()
+            store.selectedProfileId = selectedProfileId
+        }
+        persistProfiles()
+        persistSubscriptions()
+        feedback = "Подписка «${subscription.name}» удалена"
+    }
+
+    /** Применение выгрузки подписки: обновляет профили и состав группы. */
+    private fun applySubscriptionPayload(url: String, allowInsecure: Boolean, payload: String) {
+        val result = ProfileLinkParser.parseMany(payload)
+        if (result.profiles.isEmpty()) {
+            subscriptionError = "В подписке не найдено поддерживаемых профилей."
+            return
+        }
+        val trimmedUrl = url.trim()
+        val index = subscriptions.indexOfFirst { it.url.equals(trimmedUrl, ignoreCase = true) }
+        val existing = if (index >= 0) subscriptions[index] else null
+        val merge = mergeSubscriptionProfiles(profiles.toList(), existing?.profileIds.orEmpty(), result.profiles)
+        profiles.clear()
+        profiles.addAll(merge.profiles)
+        val updated = (existing ?: Subscription(name = subscriptionNameOf(trimmedUrl), url = trimmedUrl))
+            .copy(
+                allowInsecure = allowInsecure,
+                updatedAt = System.currentTimeMillis(),
+                profileIds = merge.profileIds,
+            )
+        if (index >= 0) subscriptions[index] = updated else subscriptions.add(updated)
+        persistProfiles()
+        persistSubscriptions()
+        if (selectedProfileId.isBlank() && profiles.isNotEmpty()) selectProfile(profiles.first().id)
+        pendingSubscriptionUrl = null
+        feedback = "Подписка «${updated.name}»: профилей ${merge.profileIds.size} " +
+            "(новых ${merge.added}, обновлено ${merge.updated}, удалено ${merge.removed})"
     }
 
     fun dismissSubscription() {
@@ -313,6 +404,25 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         store.darkTheme = enabled
     }
 
+    fun updateTunMtu(value: Int) {
+        if (value !in SingBoxConfigBuilder.MIN_TUN_MTU..SingBoxConfigBuilder.MAX_TUN_MTU) {
+            feedback = "Укажите MTU от ${SingBoxConfigBuilder.MIN_TUN_MTU} до ${SingBoxConfigBuilder.MAX_TUN_MTU}."
+            return
+        }
+        if (value == tunMtu) {
+            feedback = "MTU уже установлен: $value."
+            return
+        }
+        tunMtu = value
+        store.tunMtu = value
+        feedback = if (connectionState == ConnectionState.RUNNING) {
+            "MTU $value сохранён. Переподключаем туннель…"
+        } else {
+            "MTU $value сохранён и будет применён при подключении."
+        }
+        scheduleReconnectIfRunning("смена MTU на $value")
+    }
+
     fun updateProxyMode(mode: ProxyMode) {
         proxyMode = mode
         appDefaultRoute = if (mode == ProxyMode.SelectedApps) AppDefaultRoute.DIRECT else AppDefaultRoute.PROXY
@@ -354,12 +464,12 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
                 }
                 all.asSequence()
                     .filter { it.packageName != app.packageName }
-                    .filter { manager.getLaunchIntentForPackage(it.packageName) != null }
                     .map { info ->
                         InstalledApp(
                             packageName = info.packageName,
                             label = runCatching { manager.getApplicationLabel(info).toString() }
                                 .getOrDefault(info.packageName),
+                            hasLauncher = manager.getLaunchIntentForPackage(info.packageName) != null,
                         )
                     }
                     .distinctBy { it.packageName }
@@ -370,17 +480,55 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Показывать ли в списке маршрутизации системные приложения (без иконки запуска). */
+    fun updateShowSystemApps(enabled: Boolean) {
+        showSystemApps = enabled
+    }
+
+    /** Приложения для списка: системные (без иконки) — только по запросу пользователя. */
+    val visibleInstalledApps: List<InstalledApp>
+        get() = if (showSystemApps) installedApps else installedApps.filter { it.hasLauncher }
+
     fun refreshConnectionState() {
         connectionState = connectionStore.state
         connectionMessage = connectionStore.message
         activeProfileId = connectionStore.activeProfileId
+        syncSessionStart()
     }
+
+    /**
+     * Начало сеанса = момент, когда состояние стало RUNNING. Служба пишет его в файл
+     * состояния, поэтому по времени изменения файла можно восстановить длительность
+     * сеанса даже после перезапуска приложения.
+     */
+    private fun syncSessionStart() {
+        if (connectionState == ConnectionState.RUNNING) {
+            if (sessionStartedAtMs == 0L) {
+                val age = runCatching { connectionStore.ageMs }.getOrDefault(0L)
+                sessionStartedAtMs = System.currentTimeMillis() - age.coerceAtLeast(0L)
+            }
+        } else if (sessionStartedAtMs != 0L) {
+            sessionStartedAtMs = 0L
+        }
+    }
+
+    /** Текущий трафик через VPN-интерфейс (опрос из UI). */
+    fun refreshTraffic() {
+        traffic = TrafficStats.read(getApplication())
+    }
+
+    /** Длительность текущего сеанса в миллисекундах. */
+    val sessionDurationMs: Long
+        get() = if (sessionStartedAtMs == 0L) 0L else (System.currentTimeMillis() - sessionStartedAtMs).coerceAtLeast(0L)
 
     /** Тихое обновление полей из broadcast сервиса :vpn — без записи в prefs и реброадкаста. */
     fun onConnectionStateFromService(state: ConnectionState, message: String, activeProfileId: String? = null) {
         connectionState = state
         connectionMessage = message
         this.activeProfileId = activeProfileId ?: connectionStore.activeProfileId
+        // Состояние пришло из службы: заодно синхронизируем начало сеанса,
+        // иначе таймер сессии не стартует, пока UI не перечитает файл состояния.
+        syncSessionStart()
     }
 
     fun setConnectionState(state: ConnectionState, message: String = "") {
@@ -485,10 +633,20 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
             activeRouteSet = "default"
             store.activeRouteSetName = "default"
         }
-        routeRules = routeRules + RouteRule(trimmed, action)
+        // Тип правила определяется автоматически по введённому значению:
+        // IP/CIDR → ip_cidr, домен → domain_suffix, остальное → keyword.
+        val rule = RouteRule(trimmed, action, RouteRule.detectType(trimmed))
+        routeRules = routeRules + rule
         routeSetStore.save(activeRouteSet, routeRules)
         routeSetNames = routeSetStore.listSets()
         scheduleReconnectIfRunning("добавление правила «$trimmed»")
+    }
+
+    /** Включение/выключение правила: выключенное правило не попадает в конфиг ядра. */
+    fun toggleRouteRuleEnabled(rule: RouteRule) {
+        routeRules = routeRules.map { if (it == rule) it.copy(enabled = !it.enabled) else it }
+        if (activeRouteSet.isNotBlank()) routeSetStore.save(activeRouteSet, routeRules)
+        scheduleReconnectIfRunning("включение правила «${rule.value}»")
     }
 
     fun removeRouteRule(rule: RouteRule) {
@@ -497,9 +655,13 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         scheduleReconnectIfRunning("удаление правила «${rule.value}»")
     }
 
-    /** Переключение действия правила PROXY ↔ DIRECT одним нажатием на его метку. */
+    /** Переключение действия правила одним нажатием на его метку: PROXY → DIRECT → BLOCK → PROXY. */
     fun toggleRouteRuleAction(rule: RouteRule) {
-        val next = if (rule.action == RouteAction.DIRECT) RouteAction.PROXY else RouteAction.DIRECT
+        val next = when (rule.action) {
+            RouteAction.PROXY -> RouteAction.DIRECT
+            RouteAction.DIRECT -> RouteAction.BLOCK
+            RouteAction.BLOCK -> RouteAction.PROXY
+        }
         routeRules = routeRules.map { if (it == rule) it.copy(action = next) else it }
         if (activeRouteSet.isNotBlank()) routeSetStore.save(activeRouteSet, routeRules)
         scheduleReconnectIfRunning("смена действия правила «${rule.value}» на $next")
@@ -552,6 +714,7 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
 
     companion object {
         private const val RECONNECT_DEBOUNCE_MS = 1000L
+
     }
 
     // ==================== приложения: proxy / direct ====================
@@ -582,4 +745,6 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun persistProfiles() = store.saveProfiles(profiles.toList())
+
+    private fun persistSubscriptions() = store.saveSubscriptions(subscriptions.toList())
 }

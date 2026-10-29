@@ -12,7 +12,12 @@
 /*.jar
 /*.aar
 /*.xcframework/
+/experimental/libbox/*.aar
+/experimental/libbox/*.xcframework/
+/experimental/libbox/*.nupkg
 .DS_Store
 /config.d/
 /venv/
-
+CLAUDE.md
+AGENTS.md
+/.claude/

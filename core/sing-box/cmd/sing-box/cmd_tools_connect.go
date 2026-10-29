@@ -1,4 +1,4 @@
-package boxmain
+package main
 
 import (
 	"context"
@@ -45,7 +45,7 @@ func connect(address string) error {
 		return err
 	}
 	defer instance.Close()
-	dialer, err := createDialer(instance, commandConnectFlagNetwork, commandToolsFlagOutbound)
+	dialer, err := createDialer(instance, commandToolsFlagOutbound)
 	if err != nil {
 		return err
 	}

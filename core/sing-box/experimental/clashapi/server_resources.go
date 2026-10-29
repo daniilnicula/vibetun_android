@@ -3,19 +3,19 @@ package clashapi
 import (
 	"archive/zip"
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/service/filemanager"
 )
 
@@ -23,9 +23,9 @@ func (s *Server) checkAndDownloadExternalUI() {
 	if s.externalUI == "" {
 		return
 	}
-	entries, err := os.ReadDir(s.externalUI)
+	entries, err := filemanager.ReadDir(s.ctx, s.externalUI)
 	if err != nil {
-		os.MkdirAll(s.externalUI, 0o755)
+		filemanager.MkdirAll(s.ctx, s.externalUI, 0o755)
 	}
 	if len(entries) == 0 {
 		err = s.downloadExternalUI()
@@ -42,27 +42,28 @@ func (s *Server) downloadExternalUI() error {
 	} else {
 		downloadURL = "https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip"
 	}
-	s.logger.Info("downloading external ui")
 	var detour adapter.Outbound
 	if s.externalUIDownloadDetour != "" {
-		outbound, loaded := s.router.Outbound(s.externalUIDownloadDetour)
+		outbound, loaded := s.outbound.Outbound(s.externalUIDownloadDetour)
 		if !loaded {
 			return E.New("detour outbound not found: ", s.externalUIDownloadDetour)
 		}
 		detour = outbound
 	} else {
-		outbound, err := s.router.DefaultOutbound(N.NetworkTCP)
-		if err != nil {
-			return err
-		}
+		outbound := s.outbound.Default()
 		detour = outbound
 	}
+	s.logger.Info("downloading external ui using outbound/", detour.Type(), "[", detour.Tag(), "]")
 	httpClient := &http.Client{
 		Transport: &http.Transport{
 			ForceAttemptHTTP2:   true,
-			TLSHandshakeTimeout: 5 * time.Second,
+			TLSHandshakeTimeout: C.TCPTimeout,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return detour.DialContext(ctx, network, M.ParseSocksaddr(addr))
+			},
+			TLSClientConfig: &tls.Config{
+				Time:    ntp.TimeFuncFromContext(s.ctx),
+				RootCAs: adapter.RootPoolFromContext(s.ctx),
 			},
 		},
 	}
@@ -75,19 +76,19 @@ func (s *Server) downloadExternalUI() error {
 	if response.StatusCode != http.StatusOK {
 		return E.New("download external ui failed: ", response.Status)
 	}
-	err = s.downloadZIP(filepath.Base(downloadURL), response.Body, s.externalUI)
+	err = s.downloadZIP(response.Body, s.externalUI)
 	if err != nil {
-		removeAllInDirectory(s.externalUI)
+		removeAllInDirectory(s.ctx, s.externalUI)
 	}
 	return err
 }
 
-func (s *Server) downloadZIP(name string, body io.Reader, output string) error {
-	tempFile, err := filemanager.CreateTemp(s.ctx, name)
+func (s *Server) downloadZIP(body io.Reader, output string) error {
+	tempFile, err := filemanager.CreateTemp(s.ctx, "external-ui.zip")
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tempFile.Name())
+	defer filemanager.Remove(s.ctx, tempFile.Name())
 	_, err = io.Copy(tempFile, body)
 	tempFile.Close()
 	if err != nil {
@@ -111,7 +112,7 @@ func (s *Server) downloadZIP(name string, body io.Reader, output string) error {
 		if len(pathElements) > 1 {
 			saveDirectory = filepath.Join(saveDirectory, filepath.Join(pathElements[:len(pathElements)-1]...))
 		}
-		err = os.MkdirAll(saveDirectory, 0o755)
+		err = filemanager.MkdirAll(s.ctx, saveDirectory, 0o755)
 		if err != nil {
 			return err
 		}
@@ -138,13 +139,13 @@ func downloadZIPEntry(ctx context.Context, zipFile *zip.File, savePath string) e
 	return common.Error(io.Copy(saveFile, reader))
 }
 
-func removeAllInDirectory(directory string) {
-	dirEntries, err := os.ReadDir(directory)
+func removeAllInDirectory(ctx context.Context, directory string) {
+	dirEntries, err := filemanager.ReadDir(ctx, directory)
 	if err != nil {
 		return
 	}
 	for _, dirEntry := range dirEntries {
-		os.RemoveAll(filepath.Join(directory, dirEntry.Name()))
+		filemanager.RemoveAll(ctx, filepath.Join(directory, dirEntry.Name()))
 	}
 }
 

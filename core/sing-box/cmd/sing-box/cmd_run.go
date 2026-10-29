@@ -1,4 +1,4 @@
-package boxmain
+package main
 
 import (
 	"context"
@@ -12,13 +12,14 @@ import (
 	"syscall"
 	"time"
 
-	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
+	"github.com/sagernet/sing/service"
 
 	"github.com/spf13/cobra"
 )
@@ -57,7 +58,7 @@ func readConfigAt(path string) (*OptionsEntry, error) {
 	if err != nil {
 		return nil, E.Cause(err, "read config at ", path)
 	}
-	options, err := json.UnmarshalExtended[option.Options](configContent)
+	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, configContent)
 	if err != nil {
 		return nil, E.Cause(err, "decode config at ", path)
 	}
@@ -104,39 +105,43 @@ func readConfigAndMerge() (option.Options, error) {
 	if err != nil {
 		return option.Options{}, err
 	}
+	return mergeOptionsList(optionsList)
+}
+
+func mergeOptionsList(optionsList []*OptionsEntry) (option.Options, error) {
 	if len(optionsList) == 1 {
 		return optionsList[0].options, nil
 	}
-	var mergedMessage json.RawMessage
+	var (
+		mergedMessage json.RawMessage
+		err           error
+	)
 	for _, options := range optionsList {
-		mergedMessage, err = badjson.MergeJSON(options.options.RawMessage, mergedMessage)
+		mergedMessage, err = badjson.MergeJSON(globalCtx, options.options.RawMessage, mergedMessage, false)
 		if err != nil {
 			return option.Options{}, E.Cause(err, "merge config at ", options.path)
 		}
 	}
 	var mergedOptions option.Options
-	err = mergedOptions.UnmarshalJSON(mergedMessage)
+	err = mergedOptions.UnmarshalJSONContext(globalCtx, mergedMessage)
 	if err != nil {
 		return option.Options{}, E.Cause(err, "unmarshal merged config")
 	}
 	return mergedOptions, nil
 }
 
-func create() (*box.Box, context.CancelFunc, error) {
-	options, err := readConfigAndMerge()
-	if err != nil {
-		return nil, nil, err
-	}
+func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 	if disableColor {
 		if options.Log == nil {
 			options.Log = &option.LogOptions{}
 		}
 		options.Log.DisableColor = true
 	}
-	ctx, cancel := context.WithCancel(globalCtx)
+	ctx, cancel := context.WithCancel(service.ExtendContext(globalCtx))
 	instance, err := box.New(box.Options{
-		Context: ctx,
-		Options: options,
+		Context:                    ctx,
+		Options:                    options,
+		NetworkNamespaceHolderArgs: []string{"/proc/self/exe", commandNetnsHolder.Use},
 	})
 	if err != nil {
 		cancel()
@@ -167,13 +172,25 @@ func create() (*box.Box, context.CancelFunc, error) {
 }
 
 func run() error {
+	optionsList, err := readConfig()
+	if err != nil {
+		return err
+	}
+	options, err := mergeOptionsList(optionsList)
+	if err != nil {
+		return err
+	}
+	err = runInUserNamespaceIfNeeded(options, optionsList)
+	if err != nil {
+		return err
+	}
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(osSignals)
 	for {
-		instance, cancel, err := create()
-		if err != nil {
-			return err
+		instance, cancel, createErr := create(options)
+		if createErr != nil {
+			return createErr
 		}
 		runtimeDebug.FreeOSMemory()
 		for {
@@ -188,12 +205,19 @@ func run() error {
 			cancel()
 			closeCtx, closed := context.WithCancel(context.Background())
 			go closeMonitor(closeCtx)
-			instance.Close()
+			err = instance.Close()
 			closed()
 			if osSignal != syscall.SIGHUP {
+				if err != nil {
+					log.Error(E.Cause(err, "sing-box did not closed properly"))
+				}
 				return nil
 			}
 			break
+		}
+		options, err = readConfigAndMerge()
+		if err != nil {
+			return err
 		}
 	}
 }

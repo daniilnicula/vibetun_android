@@ -1,4 +1,4 @@
-package boxmain
+package main
 
 import (
 	"encoding/base64"

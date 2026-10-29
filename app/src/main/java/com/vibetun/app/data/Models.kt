@@ -40,13 +40,34 @@ data class ProfileParseResult(
 data class InstalledApp(
     val packageName: String,
     val label: String,
+    /** Системные приложения без launch-иконки показываем только по запросу. */
+    val hasLauncher: Boolean = true,
 )
 
 enum class AppTab(val label: String) {
     Profiles("Профили"),
-    Routing("Маршруты"),
+    Routing("Маршрутизация"),
     Settings("Настройки"),
 }
+
+/** Группа профилей, которая обновляется целиком по ссылке подписки. */
+data class Subscription(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String,
+    val url: String,
+    val allowInsecure: Boolean = false,
+    val updatedAt: Long = 0L,
+    val profileIds: List<String> = emptyList(),
+)
+
+/** Подписка или группа профилей одного адреса на экране серверов. */
+data class ProfileGroup(
+    val id: String,
+    val title: String,
+    val host: String,
+    val profiles: List<ProxyProfile>,
+    val subscription: Subscription? = null,
+)
 
 enum class ProxyMode(val label: String, val description: String) {
     AllApps("Все приложения", "Маршрутизировать весь трафик устройства через VPN."),

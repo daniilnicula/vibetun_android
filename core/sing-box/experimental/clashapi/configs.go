@@ -18,17 +18,19 @@ func configRouter(server *Server, logFactory log.Factory) http.Handler {
 }
 
 type configSchema struct {
-	Port        int            `json:"port"`
-	SocksPort   int            `json:"socks-port"`
-	RedirPort   int            `json:"redir-port"`
-	TProxyPort  int            `json:"tproxy-port"`
-	MixedPort   int            `json:"mixed-port"`
-	AllowLan    bool           `json:"allow-lan"`
-	BindAddress string         `json:"bind-address"`
-	Mode        string         `json:"mode"`
-	LogLevel    string         `json:"log-level"`
-	IPv6        bool           `json:"ipv6"`
-	Tun         map[string]any `json:"tun"`
+	Port        int    `json:"port"`
+	SocksPort   int    `json:"socks-port"`
+	RedirPort   int    `json:"redir-port"`
+	TProxyPort  int    `json:"tproxy-port"`
+	MixedPort   int    `json:"mixed-port"`
+	AllowLan    bool   `json:"allow-lan"`
+	BindAddress string `json:"bind-address"`
+	Mode        string `json:"mode"`
+	// sing-box added
+	ModeList []string       `json:"mode-list"`
+	LogLevel string         `json:"log-level"`
+	IPv6     bool           `json:"ipv6"`
+	Tun      map[string]any `json:"tun"`
 }
 
 func getConfigs(server *Server, logFactory log.Factory) func(w http.ResponseWriter, r *http.Request) {
@@ -40,7 +42,8 @@ func getConfigs(server *Server, logFactory log.Factory) func(w http.ResponseWrit
 			logLevel = log.LevelError
 		}
 		render.JSON(w, r, &configSchema{
-			Mode:        server.mode,
+			Mode:        server.clashMode.Mode(),
+			ModeList:    server.clashMode.ModeList(),
 			BindAddress: "*",
 			LogLevel:    log.FormatLevel(logLevel),
 		})
@@ -57,7 +60,7 @@ func patchConfigs(server *Server) func(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if newConfig.Mode != "" {
-			server.SetMode(newConfig.Mode)
+			server.clashMode.SetMode(newConfig.Mode)
 		}
 		render.NoContent(w, r)
 	}

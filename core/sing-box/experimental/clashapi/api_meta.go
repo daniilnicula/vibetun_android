@@ -2,24 +2,35 @@ package clashapi
 
 import (
 	"bytes"
+	"context"
 	"net"
 	"net/http"
+	"runtime"
+	"runtime/debug"
 	"time"
 
-	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/ws"
 	"github.com/sagernet/ws/wsutil"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/render"
 )
 
 // API created by Clash.Meta
 
 func (s *Server) setupMetaAPI(r chi.Router) {
-	r.Get("/memory", memory(s.trafficManager))
+	if s.logDebug {
+		r := chi.NewRouter()
+		r.Put("/gc", func(w http.ResponseWriter, r *http.Request) {
+			debug.FreeOSMemory()
+		})
+		r.Mount("/", middleware.Profiler())
+	}
+	r.Get("/memory", memory(s.ctx))
 	r.Mount("/group", groupRouter(s))
+	r.Mount("/upgrade", upgradeRouter(s))
 }
 
 type Memory struct {
@@ -27,7 +38,13 @@ type Memory struct {
 	OSLimit uint64 `json:"oslimit"` // maybe we need it in the future
 }
 
-func memory(trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+func inuseMemory() uint64 {
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	return memStats.StackInuse + memStats.HeapInuse + memStats.HeapIdle - memStats.HeapReleased
+}
+
+func memory(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var conn net.Conn
 		if r.Header.Get("Upgrade") == "websocket" {
@@ -36,6 +53,7 @@ func memory(trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r
 			if err != nil {
 				return
 			}
+			defer conn.Close()
 		}
 
 		if conn == nil {
@@ -48,10 +66,15 @@ func memory(trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r
 		buf := &bytes.Buffer{}
 		var err error
 		first := true
-		for range tick.C {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
 			buf.Reset()
 
-			inuse := trafficManager.Snapshot().Memory
+			inuse := inuseMemory()
 
 			// make chat.js begin with zero
 			// this is shit var,but we need output 0 for first time

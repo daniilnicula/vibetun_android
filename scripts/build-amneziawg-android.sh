@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORE_DIR="$ROOT_DIR/core/amneziawg-android"
 JNI_LIBS="$ROOT_DIR/app/src/main/jniLibs"
-NDK_VERSION="26.2.11394342"
+NDK_VERSION="30.0.16248370"
 ANDROID_API="26"
 
 if [[ "$(go env GOVERSION)" != go1.25.* ]]; then
@@ -17,7 +17,13 @@ if [[ -z "${ANDROID_HOME:-}" ]]; then
 fi
 
 NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
-TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+case "$(uname -s)" in
+  Linux*) NDK_HOST="linux-x86_64"; CLANG_SUFFIX="" ;;
+  Darwin*) NDK_HOST="darwin-x86_64"; CLANG_SUFFIX="" ;;
+  MINGW*|MSYS*|CYGWIN*) NDK_HOST="windows-x86_64"; CLANG_SUFFIX=".cmd" ;;
+  *) echo "Unsupported NDK host: $(uname -s)" >&2; exit 1 ;;
+esac
+TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin"
 if [[ ! -f "$NDK/source.properties" ]]; then
   echo "Android NDK $NDK_VERSION is missing. Install it with sdkmanager first." >&2
   exit 1
@@ -40,7 +46,7 @@ build_one() {
     GOARCH="$goarch" \
     GOARM="$goarm" \
     CGO_ENABLED=1 \
-    CC="$TOOLCHAIN/$clang" \
+    CC="$TOOLCHAIN/$clang$CLANG_SUFFIX" \
     CGO_CFLAGS="-O2" \
     CGO_LDFLAGS="-Wl,-z,max-page-size=16384" \
     go build \

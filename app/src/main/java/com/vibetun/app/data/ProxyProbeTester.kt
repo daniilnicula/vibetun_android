@@ -3,13 +3,16 @@ package com.vibetun.app.data
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import com.vibetun.app.service.LibboxCommandServerHandler
+import com.vibetun.app.service.LibboxPlatformInterface
 import com.vibetun.app.service.VibeTunVpnService
-import io.nekohasekai.libbox.BoxService
+import io.nekohasekai.libbox.CommandServer
 import io.nekohasekai.libbox.InterfaceUpdateListener
 import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.NetworkInterface
 import io.nekohasekai.libbox.NetworkInterfaceIterator
-import io.nekohasekai.libbox.PlatformInterface
+import io.nekohasekai.libbox.OverrideOptions
+import io.nekohasekai.libbox.SetupOptions
 import io.nekohasekai.libbox.TunOptions
 import io.nekohasekai.libbox.WIFIState
 import java.net.HttpURLConnection
@@ -28,11 +31,16 @@ import java.util.concurrent.TimeUnit
  */
 object ProxyProbeTester {
     private const val PROBE_TARGET = "http://www.gstatic.com/generate_204"
+    private val probeLock = Any()
 
     @Volatile
     private var libboxReady: Boolean = false
 
-    fun ping(context: Context, profile: ProxyProfile, attempts: Int = 3, timeoutMs: Int = 5000): Long? {
+    fun ping(context: Context, profile: ProxyProfile, attempts: Int = 3, timeoutMs: Int = 5000): Long? =
+        synchronized(probeLock) { pingLocked(context, profile, attempts, timeoutMs) }
+
+    /** Групповые кнопки приходят параллельно, но временные ядра запускаем строго по одному. */
+    private fun pingLocked(context: Context, profile: ProxyProfile, attempts: Int, timeoutMs: Int): Long? {
         val appContext = context.applicationContext
         val port = runCatching { ServerSocket(0).use { it.localPort } }.getOrNull()
             ?: return LatencyTester.ping(profile, attempts, timeoutMs)
@@ -40,8 +48,8 @@ object ProxyProbeTester {
             ?: return LatencyTester.ping(profile, attempts, timeoutMs)
         if (!ensureLibbox(appContext)) return LatencyTester.ping(profile, attempts, timeoutMs)
 
-        val service: BoxService = try {
-            Libbox.newService(config, ProbePlatformInterface())
+        val service: CommandServer = try {
+            Libbox.newCommandServer(LibboxCommandServerHandler(), ProbePlatformInterface())
         } catch (_: Exception) {
             return LatencyTester.ping(profile, attempts, timeoutMs)
         }
@@ -50,7 +58,8 @@ object ProxyProbeTester {
         // Если VPN активен, без привязки они уйдут в собственный TUN и замер не получится.
         val boundNetwork = bindProcessToPhysicalNetwork(appContext)
         try {
-            service.start()
+            // gRPC command.sock для локальной пробы не нужен: startOrReloadService работает напрямую.
+            service.startOrReloadService(config, OverrideOptions())
             repeat(attempts) { attempt ->
                 val started = System.nanoTime()
                 try {
@@ -75,6 +84,8 @@ object ProxyProbeTester {
         } catch (_: Exception) {
             // сервис не стартовал — best останется null
         } finally {
+            // Сначала останавливаем BoxService и освобождаем probe-cache.db, затем CommandServer.
+            runCatching { service.closeService() }
             runCatching { service.close() }
             if (boundNetwork) {
                 runCatching { appContext.getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(null) }
@@ -104,12 +115,14 @@ object ProxyProbeTester {
         synchronized(this) {
             if (libboxReady) return true
             return runCatching {
-                Libbox.setup(
-                    context.filesDir.absolutePath,
-                    context.filesDir.absolutePath,
-                    context.cacheDir.absolutePath,
-                    false,
-                )
+                Libbox.setup(SetupOptions().apply {
+                    basePath = context.filesDir.absolutePath
+                    workingPath = context.filesDir.absolutePath
+                    tempPath = context.cacheDir.absolutePath
+                    fixAndroidStack = false
+                    logMaxLines = 3000
+                    debug = false
+                })
                 libboxReady = true
                 true
             }.getOrDefault(false)
@@ -117,7 +130,7 @@ object ProxyProbeTester {
     }
 
     /** Минимальная реализация PlatformInterface для временного probe-сервиса (без TUN). */
-    private class ProbePlatformInterface : PlatformInterface {
+    private class ProbePlatformInterface : LibboxPlatformInterface {
         override fun autoDetectInterfaceControl(fd: Int) {
             // Если VPN активен, сокет иначе уйдёт в собственный туннель.
             VibeTunVpnService.instance?.protect(fd)
@@ -127,14 +140,8 @@ object ProxyProbeTester {
         override fun openTun(options: TunOptions): Int =
             throw IllegalStateException("Probe-сервис не использует TUN.")
 
-        override fun useProcFS(): Boolean = false
-        override fun findConnectionOwner(ipProtocol: Int, sourceAddress: String?, sourcePort: Int, destinationAddress: String?, destinationPort: Int): Int = -1
-        override fun packageNameByUid(uid: Int): String = ""
-        override fun uidByPackageName(packageName: String?): Int = -1
-        override fun usePlatformDefaultInterfaceMonitor(): Boolean = false
         override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {}
         override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {}
-        override fun usePlatformInterfaceGetter(): Boolean = false
 
         override fun getInterfaces(): NetworkInterfaceIterator = object : NetworkInterfaceIterator {
             override fun hasNext(): Boolean = false
@@ -145,6 +152,5 @@ object ProxyProbeTester {
         override fun includeAllNetworks(): Boolean = false
         override fun readWIFIState(): WIFIState? = null
         override fun clearDNSCache() {}
-        override fun writeLog(message: String?) {}
     }
 }

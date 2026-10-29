@@ -11,7 +11,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/outbound"
+	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -23,10 +23,10 @@ import (
 
 func proxyRouter(server *Server, router adapter.Router) http.Handler {
 	r := chi.NewRouter()
-	r.Get("/", getProxies(server, router))
+	r.Get("/", getProxies(server))
 
 	r.Route("/{name}", func(r chi.Router) {
-		r.Use(parseProxyName, findProxyByName(router))
+		r.Use(parseProxyName, findProxyByName(server))
 		r.Get("/", getProxy(server))
 		r.Get("/delay", getProxyDelay(server))
 		r.Put("/", updateProxy)
@@ -42,11 +42,11 @@ func parseProxyName(next http.Handler) http.Handler {
 	})
 }
 
-func findProxyByName(router adapter.Router) func(next http.Handler) http.Handler {
+func findProxyByName(server *Server) func(next http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			name := r.Context().Value(CtxKeyProxyName).(string)
-			proxy, exist := router.Outbound(name)
+			proxy, exist := server.outbound.Outbound(name)
 			if !exist {
 				render.Status(r, http.StatusNotFound)
 				render.JSON(w, r, ErrNotFound)
@@ -70,25 +70,34 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	info.Put("type", clashType)
 	info.Put("name", detour.Tag())
 	info.Put("udp", common.Contains(detour.Network(), N.NetworkUDP))
-	delayHistory := server.urlTestHistory.LoadURLTestHistory(adapter.OutboundTag(detour))
+	delayHistory := server.urlTestHistory.LoadURLTestHistory(group.RealTag(detour, N.NetworkTCP))
 	if delayHistory != nil {
-		info.Put("history", []*urltest.History{delayHistory})
+		info.Put("history", []*adapter.URLTestHistory{delayHistory})
 	} else {
-		info.Put("history", []*urltest.History{})
+		info.Put("history", []*adapter.URLTestHistory{})
 	}
 	if group, isGroup := detour.(adapter.OutboundGroup); isGroup {
-		info.Put("now", group.Now())
+		var now string
+		if selected := group.Selected(N.NetworkTCP); selected != nil {
+			now = selected.Tag()
+		}
+		info.Put("now", now)
 		info.Put("all", group.All())
 	}
 	return &info
 }
 
-func getProxies(server *Server, router adapter.Router) func(w http.ResponseWriter, r *http.Request) {
+func getProxies(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var proxyMap badjson.JSONObject
-		outbounds := common.Filter(router.Outbounds(), func(detour adapter.Outbound) bool {
+		outbounds := common.Filter(server.outbound.Outbounds(), func(detour adapter.Outbound) bool {
 			return detour.Tag() != ""
 		})
+		outbounds = append(outbounds, common.Map(common.Filter(server.endpoint.Endpoints(), func(detour adapter.Endpoint) bool {
+			return detour.Tag() != ""
+		}), func(it adapter.Endpoint) adapter.Outbound {
+			return it
+		})...)
 
 		allProxies := make([]string, 0, len(outbounds))
 
@@ -100,12 +109,7 @@ func getProxies(server *Server, router adapter.Router) func(w http.ResponseWrite
 			allProxies = append(allProxies, detour.Tag())
 		}
 
-		var defaultTag string
-		if defaultOutbound, err := router.DefaultOutbound(N.NetworkTCP); err == nil {
-			defaultTag = defaultOutbound.Tag()
-		} else {
-			defaultTag = allProxies[0]
-		}
+		defaultTag := server.outbound.Default().Tag()
 
 		sort.SliceStable(allProxies, func(i, j int) bool {
 			return allProxies[i] == defaultTag
@@ -116,7 +120,7 @@ func getProxies(server *Server, router adapter.Router) func(w http.ResponseWrite
 			"type":    "Fallback",
 			"name":    "GLOBAL",
 			"udp":     true,
-			"history": []*urltest.History{},
+			"history": []*adapter.URLTestHistory{},
 			"all":     allProxies,
 			"now":     defaultTag,
 		})
@@ -168,7 +172,7 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
-	selector, ok := proxy.(*outbound.Selector)
+	selector, ok := proxy.(*group.Selector)
 	if !ok {
 		render.Status(r, http.StatusBadRequest)
 		render.JSON(w, r, newError("Must be a Selector"))
@@ -182,6 +186,30 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	render.NoContent(w, r)
+}
+
+func groupContains(outboundManager adapter.OutboundManager, outboundGroup adapter.OutboundGroup, tag string, visited map[string]bool) bool {
+	for _, memberTag := range outboundGroup.All() {
+		if memberTag == tag {
+			return true
+		}
+		member, loaded := outboundManager.Outbound(memberTag)
+		if !loaded {
+			continue
+		}
+		if group.RealTag(member, N.NetworkTCP) == tag {
+			return true
+		}
+		memberGroup, isGroup := member.(adapter.OutboundGroup)
+		if !isGroup || visited[memberTag] {
+			continue
+		}
+		visited[memberTag] = true
+		if groupContains(outboundManager, memberGroup, tag, visited) {
+			return true
+		}
+	}
+	return false
 }
 
 func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {
@@ -204,14 +232,24 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 
 		delay, err := urltest.URLTest(ctx, url, proxy)
 		defer func() {
-			realTag := outbound.RealTag(proxy)
+			realTag := group.RealTag(proxy, N.NetworkTCP)
 			if err != nil {
 				server.urlTestHistory.DeleteURLTestHistory(realTag)
 			} else {
-				server.urlTestHistory.StoreURLTestHistory(realTag, &urltest.History{
+				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: delay,
 				})
+			}
+			for _, detour := range server.outbound.Outbounds() {
+				urlTestGroup, isURLTestGroup := detour.(adapter.URLTestGroup)
+				if !isURLTestGroup {
+					continue
+				}
+				if !groupContains(server.outbound, urlTestGroup, realTag, map[string]bool{detour.Tag(): true}) {
+					continue
+				}
+				urlTestGroup.PerformUpdateCheck()
 			}
 		}()
 

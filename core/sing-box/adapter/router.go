@@ -2,118 +2,157 @@ package adapter
 
 import (
 	"context"
-	"net/http"
+	"net"
 	"net/netip"
+	"time"
 
-	"github.com/sagernet/sing-box/common/geoip"
-	"github.com/sagernet/sing-dns"
 	"github.com/sagernet/sing-tun"
-	"github.com/sagernet/sing/common/control"
+	"github.com/sagernet/sing-tun/gtcpip/header"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/common/x/list"
 
-	mdns "github.com/miekg/dns"
+	"go4.org/netipx"
 )
 
 type Router interface {
-	Service
-	PreStarter
-	PostStarter
-
-	Outbounds() []Outbound
-	Outbound(tag string) (Outbound, bool)
-	DefaultOutbound(network string) (Outbound, error)
-
-	FakeIPStore() FakeIPStore
-
+	Lifecycle
 	ConnectionRouter
-
-	GeoIPReader() *geoip.Reader
-	LoadGeosite(code string) (Rule, error)
-
+	PreMatch(metadata InboundContext, firstPacket []byte) PreMatchResult
+	HijackDNSPacket(ctx context.Context, payload []byte, writer N.PacketWriter, metadata InboundContext)
+	ConnectionRouterEx
 	RuleSet(tag string) (RuleSet, bool)
-
-	NeedWIFIState() bool
-
-	Exchange(ctx context.Context, message *mdns.Msg) (*mdns.Msg, error)
-	Lookup(ctx context.Context, domain string, strategy dns.DomainStrategy) ([]netip.Addr, error)
-	LookupDefault(ctx context.Context, domain string) ([]netip.Addr, error)
-	ClearDNSCache()
-
-	InterfaceFinder() control.InterfaceFinder
-	UpdateInterfaces() error
-	DefaultInterface() string
-	AutoDetectInterface() bool
-	AutoDetectInterfaceFunc() control.Func
-	DefaultMark() int
-	NetworkMonitor() tun.NetworkUpdateMonitor
-	InterfaceMonitor() tun.DefaultInterfaceMonitor
-	PackageManager() tun.PackageManager
-	WIFIState() WIFIState
 	Rules() []Rule
-
-	ClashServer() ClashServer
-	SetClashServer(server ClashServer)
-
-	V2RayServer() V2RayServer
-	SetV2RayServer(server V2RayServer)
-
-	ResetNetwork() error
+	NeedFindProcess() bool
+	NeedFindNeighbor() bool
+	NeighborResolver() NeighborResolver
+	AppendTracker(tracker ConnectionTracker)
+	ResetNetwork()
 }
 
-func ContextWithRouter(ctx context.Context, router Router) context.Context {
-	return service.ContextWith(ctx, router)
+type PreMatchAction uint8
+
+const (
+	PreMatchContinue PreMatchAction = iota
+	PreMatchFlow
+	PreMatchReject
+	PreMatchDrop
+	PreMatchBypass
+	PreMatchHijackDNS
+)
+
+type PreMatchResult struct {
+	Action      PreMatchAction
+	Outbound    Outbound
+	Destination netip.AddrPort
+	UDPTimeout  time.Duration
+	NewTracker  func() tun.FlowTracker
 }
 
-func RouterFromContext(ctx context.Context) Router {
-	return service.FromContext[Router](ctx)
+func JudgeFlow(router Router, inbound string, inboundType string, network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) tun.FlowVerdict {
+	var networkName string
+	switch network {
+	case uint8(header.TCPProtocolNumber):
+		networkName = N.NetworkTCP
+	case uint8(header.UDPProtocolNumber):
+		networkName = N.NetworkUDP
+	case uint8(header.ICMPv4ProtocolNumber), uint8(header.ICMPv6ProtocolNumber):
+		networkName = N.NetworkICMP
+	default:
+		return tun.FlowVerdict{Action: tun.ActionAccept}
+	}
+	metadata := InboundContext{
+		Inbound:     inbound,
+		InboundType: inboundType,
+		Network:     networkName,
+		Source:      M.SocksaddrFromNetIP(source),
+		Destination: M.SocksaddrFromNetIP(destination),
+	}
+	if networkName == N.NetworkICMP {
+		metadata.Source.Port = 0
+		metadata.Destination.Port = 0
+	}
+	result := router.PreMatch(metadata, firstPacket)
+	switch result.Action {
+	case PreMatchFlow:
+		port, isPort := result.Outbound.(tun.Port)
+		if !isPort {
+			return tun.FlowVerdict{Action: tun.ActionAccept}
+		}
+		verdict := tun.FlowVerdict{Action: tun.ActionFlow, Port: port, UDPTimeout: result.UDPTimeout, NewTracker: result.NewTracker}
+		if result.Destination.IsValid() {
+			destinationPort := result.Destination.Port()
+			if networkName == N.NetworkICMP {
+				destinationPort = destination.Port()
+			}
+			verdict.Destination = netip.AddrPortFrom(result.Destination.Addr(), destinationPort)
+		}
+		return verdict
+	case PreMatchReject:
+		return tun.FlowVerdict{Action: tun.ActionReject}
+	case PreMatchDrop:
+		return tun.FlowVerdict{Action: tun.ActionDrop}
+	case PreMatchBypass:
+		port, isPort := result.Outbound.(tun.Port)
+		if !isPort {
+			return tun.FlowVerdict{Action: tun.ActionBypass}
+		}
+		return tun.FlowVerdict{Action: tun.ActionBypass, Port: port, UDPTimeout: result.UDPTimeout, NewTracker: result.NewTracker}
+	case PreMatchHijackDNS:
+		return tun.FlowVerdict{Action: tun.ActionHijackDNS}
+	default:
+		return tun.FlowVerdict{Action: tun.ActionAccept}
+	}
 }
 
-type HeadlessRule interface {
-	Match(metadata *InboundContext) bool
-	String() string
+type ConnectionTracker interface {
+	RoutedConnection(ctx context.Context, conn net.Conn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) net.Conn
+	RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) N.PacketConn
+	RoutedFlow(ctx context.Context, metadata InboundContext, matchedRule Rule, matchOutbound Outbound) tun.FlowTracker
 }
 
-type Rule interface {
-	HeadlessRule
-	Service
-	Type() string
-	UpdateGeosite() error
-	Outbound() string
+// Deprecated: Use ConnectionRouterEx instead.
+type ConnectionRouter interface {
+	RouteConnection(ctx context.Context, conn net.Conn, metadata InboundContext) error
+	RoutePacketConnection(ctx context.Context, conn N.PacketConn, metadata InboundContext) error
 }
 
-type DNSRule interface {
-	Rule
-	DisableCache() bool
-	RewriteTTL() *uint32
-	ClientSubnet() *netip.Prefix
-	WithAddressLimit() bool
-	MatchAddressLimit(metadata *InboundContext) bool
+type ConnectionRouterEx interface {
+	ConnectionRouter
+	RouteConnectionEx(ctx context.Context, conn net.Conn, metadata InboundContext, onClose N.CloseHandlerFunc)
+	RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata InboundContext, onClose N.CloseHandlerFunc)
 }
 
 type RuleSet interface {
-	StartContext(ctx context.Context, startContext RuleSetStartContext) error
+	Name() string
+	StartContext(ctx context.Context, startContext *HTTPStartContext) error
 	Metadata() RuleSetMetadata
+	ExtractIPSet() []*netipx.IPSet
+	IncRef()
+	DecRef()
+	Cleanup()
+	RegisterCallback(callback RuleSetUpdateCallback) *list.Element[RuleSetUpdateCallback]
+	UnregisterCallback(element *list.Element[RuleSetUpdateCallback])
 	Close() error
 	HeadlessRule
 }
 
+type RuleSetUpdateCallback func(it RuleSet)
+
+type DNSRuleSetUpdateValidator interface {
+	ValidateRuleSetMetadataUpdate(tag string, metadata RuleSetMetadata) error
+}
+
+// ip_version is not a headless-rule item, so ContainsIPVersionRule is intentionally absent.
 type RuleSetMetadata struct {
-	ContainsProcessRule bool
-	ContainsWIFIRule    bool
-	ContainsIPCIDRRule  bool
-}
-
-type RuleSetStartContext interface {
-	HTTPClient(detour string, dialer N.Dialer) *http.Client
-	Close()
-}
-
-type InterfaceUpdateListener interface {
-	InterfaceUpdated()
-}
-
-type WIFIState struct {
-	SSID  string
-	BSSID string
+	ContainsProcessRule      bool
+	ContainsWIFIRule         bool
+	ContainsIPCIDRRule       bool
+	ContainsDNSQueryTypeRule bool
+	// ContainsNonIPCIDRRule signals that the rule-set carries at least one sub-rule
+	// with a predicate other than destination ip_cidr / ip_set, so it can contribute
+	// to DNS pre-response matching. A rule-set where this is false and
+	// ContainsIPCIDRRule is true is "pure-IP" and matches nothing before a DNS
+	// response is available.
+	ContainsNonIPCIDRRule bool
 }

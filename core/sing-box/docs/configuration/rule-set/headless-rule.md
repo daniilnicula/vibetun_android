@@ -1,3 +1,23 @@
+---
+icon: material/new-box
+---
+
+!!! quote "Changes in sing-box 1.14.0"
+
+    :material-plus: [package_name_regex](#package_name_regex)  
+    :material-alert: [query_type](#query_type)
+
+!!! quote "Changes in sing-box 1.13.0"
+
+    :material-plus: [network_interface_address](#network_interface_address)  
+    :material-plus: [default_interface_address](#default_interface_address)
+
+!!! quote "Changes in sing-box 1.11.0"
+
+    :material-plus: [network_type](#network_type)  
+    :material-plus: [network_is_expensive](#network_is_expensive)  
+    :material-plus: [network_is_constrained](#network_is_constrained)
+
 ### Structure
 
 !!! question "Since sing-box 1.8.0"
@@ -57,8 +77,27 @@
       "process_path": [
         "/usr/bin/curl"
       ],
+      "process_path_regex": [
+        "^/usr/bin/.+"
+      ],
       "package_name": [
         "com.termux"
+      ],
+      "package_name_regex": [
+        "^com\\.termux.*"
+      ],
+      "network_type": [
+        "wifi"
+      ],
+      "network_is_expensive": false,
+      "network_is_constrained": false,
+      "network_interface_address": {
+        "wifi": [
+          "2000::/3"
+        ]
+      },
+      "default_interface_address": [
+        "2000::/3"
       ],
       "wifi_ssid": [
         "My WIFI"
@@ -93,6 +132,18 @@
     `other fields`
 
 #### query_type
+
+!!! quote "Changes in sing-box 1.14.0"
+
+    When a DNS rule references this rule-set, this field now also applies
+    when the DNS rule is matched from an internal domain resolution that
+    does not target a specific DNS server. See
+    [Migration](/migration/#ip_version-and-query_type-behavior-changes-in-dns-rules).
+
+    When a DNS rule references a rule-set containing this field, the DNS
+    rule is incompatible in the same DNS configuration with Legacy Address
+    Filter Fields in DNS rules, the Legacy `strategy` DNS rule action
+    option, and the Legacy `rule_set_ip_cidr_accept_empty` DNS rule item.
 
 DNS query type. Values can be integers or type name strings.
 
@@ -160,9 +211,78 @@ Match process name.
 
 Match process path.
 
+#### process_path_regex
+
+!!! question "Since sing-box 1.10.0"
+
+!!! quote ""
+
+    Only supported on Linux, Windows, and macOS.
+
+Match process path using regular expression.
+
 #### package_name
 
 Match android package name.
+
+#### package_name_regex
+
+!!! question "Since sing-box 1.14.0"
+
+Match android package name using regular expression.
+
+#### network_type
+
+!!! question "Since sing-box 1.11.0"
+
+!!! quote ""
+
+    Only supported in graphical clients on Android and Apple platforms.
+
+Match network type.
+
+Available values: `wifi`, `cellular`, `ethernet` and `other`.
+
+#### network_is_expensive
+
+!!! question "Since sing-box 1.11.0"
+
+!!! quote ""
+
+    Only supported in graphical clients on Android and Apple platforms.
+
+Match if network is considered Metered (on Android) or considered expensive,
+such as Cellular or a Personal Hotspot (on Apple platforms).
+
+#### network_is_constrained
+
+!!! question "Since sing-box 1.11.0"
+
+!!! quote ""
+
+    Only supported in graphical clients on Apple platforms.
+
+Match if network is in Low Data Mode.
+
+#### network_interface_address
+
+!!! question "Since sing-box 1.13.0"
+
+!!! quote ""
+
+    Only supported in graphical clients on Android and Apple platforms.
+
+Matches network interface (same values as `network_type`) address.
+
+#### default_interface_address
+
+!!! question "Since sing-box 1.13.0"
+
+!!! quote ""
+
+    Only supported on Linux, Windows, and macOS.
+
+Match default interface address.
 
 #### wifi_ssid
 

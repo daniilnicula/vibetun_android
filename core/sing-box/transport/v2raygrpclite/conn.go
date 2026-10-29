@@ -2,6 +2,7 @@ package v2raygrpclite
 
 import (
 	std_bufio "bufio"
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -13,7 +14,7 @@ import (
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
-	"github.com/sagernet/sing/common/rw"
+	"github.com/sagernet/sing/common/varbin"
 )
 
 // kanged from: https://github.com/Qv2ray/gun-lite
@@ -21,31 +22,37 @@ import (
 var _ net.Conn = (*GunConn)(nil)
 
 type GunConn struct {
+	rawReader     io.Reader
 	reader        *std_bufio.Reader
 	writer        io.Writer
 	flusher       http.Flusher
 	create        chan struct{}
 	err           error
-	readRemaining int
+	cancel        context.CancelFunc
+	readRemaining uint64
+	onClose       func()
 }
 
 func newGunConn(reader io.Reader, writer io.Writer, flusher http.Flusher) *GunConn {
 	return &GunConn{
-		reader:  std_bufio.NewReader(reader),
-		writer:  writer,
-		flusher: flusher,
+		rawReader: reader,
+		reader:    std_bufio.NewReader(reader),
+		writer:    writer,
+		flusher:   flusher,
 	}
 }
 
-func newLateGunConn(writer io.Writer) *GunConn {
+func newLateGunConn(writer io.Writer, cancel context.CancelFunc) *GunConn {
 	return &GunConn{
 		create: make(chan struct{}),
 		writer: writer,
+		cancel: cancel,
 	}
 }
 
 func (c *GunConn) setup(reader io.Reader, err error) {
 	if reader != nil {
+		c.rawReader = reader
 		c.reader = std_bufio.NewReader(reader)
 	}
 	c.err = err
@@ -58,7 +65,7 @@ func (c *GunConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *GunConn) read(b []byte) (n int, err error) {
-	if c.reader == nil {
+	if c.create != nil {
 		<-c.create
 		if c.err != nil {
 			return 0, c.err
@@ -66,11 +73,11 @@ func (c *GunConn) read(b []byte) (n int, err error) {
 	}
 
 	if c.readRemaining > 0 {
-		if len(b) > c.readRemaining {
+		if uint64(len(b)) > c.readRemaining {
 			b = b[:c.readRemaining]
 		}
 		n, err = c.reader.Read(b)
-		c.readRemaining -= n
+		c.readRemaining -= uint64(n)
 		return
 	}
 
@@ -84,19 +91,18 @@ func (c *GunConn) read(b []byte) (n int, err error) {
 		return
 	}
 
-	readLen := int(dataLen)
-	c.readRemaining = readLen
-	if len(b) > readLen {
-		b = b[:readLen]
+	c.readRemaining = dataLen
+	if uint64(len(b)) > dataLen {
+		b = b[:dataLen]
 	}
 
 	n, err = c.reader.Read(b)
-	c.readRemaining -= n
+	c.readRemaining -= uint64(n)
 	return
 }
 
 func (c *GunConn) Write(b []byte) (n int, err error) {
-	varLen := rw.UVariantLen(uint64(len(b)))
+	varLen := varbin.UvarintLen(uint64(len(b)))
 	buffer := buf.NewSize(6 + varLen + len(b))
 	header := buffer.Extend(6 + varLen)
 	header[0] = 0x00
@@ -117,13 +123,13 @@ func (c *GunConn) Write(b []byte) (n int, err error) {
 func (c *GunConn) WriteBuffer(buffer *buf.Buffer) error {
 	defer buffer.Release()
 	dataLen := buffer.Len()
-	varLen := rw.UVariantLen(uint64(dataLen))
+	varLen := varbin.UvarintLen(uint64(dataLen))
 	header := buffer.ExtendHeader(6 + varLen)
 	header[0] = 0x00
 	binary.BigEndian.PutUint32(header[1:5], uint32(1+varLen+dataLen))
 	header[5] = 0x0A
 	binary.PutUvarint(header[6:], uint64(dataLen))
-	err := rw.WriteBytes(c.writer, buffer.Bytes())
+	err := common.Error(c.writer.Write(buffer.Bytes()))
 	if err != nil {
 		return baderror.WrapH2(err)
 	}
@@ -138,7 +144,24 @@ func (c *GunConn) FrontHeadroom() int {
 }
 
 func (c *GunConn) Close() error {
-	return common.Close(c.reader, c.writer)
+	var reader io.Reader
+	if c.create != nil {
+		select {
+		case <-c.create:
+			reader = c.rawReader
+		default:
+		}
+	} else {
+		reader = c.rawReader
+	}
+	err := common.Close(reader, c.writer)
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return err
 }
 
 func (c *GunConn) LocalAddr() net.Addr {

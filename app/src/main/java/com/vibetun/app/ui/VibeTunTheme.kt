@@ -7,6 +7,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 
 /** Palette copied from VibeTun Windows' Dark.xaml / Light.xaml. */
 data class GorePalette(
@@ -22,6 +23,9 @@ data class GorePalette(
     val textMuted: Color,
     val accent: Color,
     val accentSoft: Color,
+
+    /** Цвет текста/иконок поверх акцента: у светлого акцента — тёмный, у тёмного — белый. */
+    val onAccent: Color,
     val success: Color,
     val successSoft: Color,
     val warning: Color,
@@ -31,18 +35,20 @@ data class GorePalette(
 )
 
 private val DarkGorePalette = GorePalette(
-    window = Color(0xFF191B1D),
-    panel = Color(0xFF1F2226),
-    card = Color(0xFF242830),
-    cardAlt = Color(0xFF2A2F38),
-    input = Color(0xFF20242A),
-    border = Color(0xFF2C3138),
-    divider = Color(0xFF272C33),
+    window = Color(0xFF141518),
+    panel = Color(0xFF191B1E),
+    card = Color(0xFF1E2024),
+    cardAlt = Color(0xFF25282E),
+    input = Color(0xFF1B1D21),
+    border = Color(0xFF2A2E35),
+    divider = Color(0xFF24272D),
     text = Color(0xFFE9EBEE),
     textSecondary = Color(0xFFA7AEB8),
     textMuted = Color(0xFF6C7480),
-    accent = Color(0xFF5C96FF),
-    accentSoft = Color(0xFF2A3A58),
+    // Акцент по умолчанию — розовый #FF758AAC.
+    accent = Color(0xFFFF758AAC),
+    accentSoft = Color(0x2AFF758AAC),
+    onAccent = Color(0xFFFFFFFF),
     success = Color(0xFF3BC08A),
     successSoft = Color(0xFF1E3A30),
     warning = Color(0xFFE5B24B),
@@ -55,15 +61,16 @@ private val LightGorePalette = GorePalette(
     window = Color(0xFFF4F5F7),
     panel = Color(0xFFFFFFFF),
     card = Color(0xFFFFFFFF),
-    cardAlt = Color(0xFFF7F8FA),
+    cardAlt = Color(0xFFF1F2F5),
     input = Color(0xFFFFFFFF),
-    border = Color(0xFFE4E7EC),
+    border = Color(0xFFE0E3E8),
     divider = Color(0xFFECEEF1),
     text = Color(0xFF1D2024),
     textSecondary = Color(0xFF5C6570),
     textMuted = Color(0xFF8B929C),
-    accent = Color(0xFF2E6EE0),
-    accentSoft = Color(0xFFE3ECFB),
+    accent = Color(0xFFFF758AAC),
+    accentSoft = Color(0x33FF758AAC),
+    onAccent = Color(0xFFFFFFFF),
     success = Color(0xFF1F9D6B),
     successSoft = Color(0xFFE1F5EC),
     warning = Color(0xFFB57C14),
@@ -81,14 +88,18 @@ fun VibeTunTheme(darkTheme: Boolean, accentColorArgb: Int = 0, content: @Composa
     // хранится в настройках и переживает перезапуск приложения.
     val palette = if (accentColorArgb != 0) {
         val accent = Color(accentColorArgb)
-        base.copy(accent = accent, accentSoft = accent.copy(alpha = 0.16f))
+        base.copy(
+            accent = accent,
+            accentSoft = accent.copy(alpha = 0.16f),
+            onAccent = onAccentFor(accent),
+        )
     } else {
         base
     }
     val scheme = if (darkTheme) {
         darkColorScheme(
             primary = palette.accent,
-            onPrimary = Color.White,
+            onPrimary = palette.onAccent,
             background = palette.window,
             surface = palette.card,
             onSurface = palette.text,
@@ -100,7 +111,7 @@ fun VibeTunTheme(darkTheme: Boolean, accentColorArgb: Int = 0, content: @Composa
     } else {
         lightColorScheme(
             primary = palette.accent,
-            onPrimary = Color.White,
+            onPrimary = palette.onAccent,
             background = palette.window,
             surface = palette.card,
             onSurface = palette.text,
@@ -114,3 +125,10 @@ fun VibeTunTheme(darkTheme: Boolean, accentColorArgb: Int = 0, content: @Composa
         MaterialTheme(colorScheme = scheme, content = content)
     }
 }
+
+/**
+ * Цвет текста поверх акцента: на светлом акценте (песок, золото) — тёмный,
+ * на тёмном (розовый, синий, фиолетовый) — белый.
+ */
+private fun onAccentFor(accent: Color): Color =
+    if (accent.luminance() > 0.45f) Color(0xFF1A1712) else Color.White

@@ -7,8 +7,11 @@ import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 
-/** Converts a VibeTun profile into the sing-box 1.9.x Android service configuration. */
+/** Converts a VibeTun profile into the sing-box 1.14.4 Android service configuration. */
 object SingBoxConfigBuilder {
+    const val DEFAULT_TUN_MTU = 9000
+    const val MIN_TUN_MTU = 576
+    const val MAX_TUN_MTU = 9000
     private const val PROXY_TAG = "vibetun-proxy"
     private const val TUN_TAG = "vibetun-tun"
     private const val DNS_TAG = "vibetun-dns"
@@ -16,19 +19,12 @@ object SingBoxConfigBuilder {
     private const val DNS_DIRECT_TAG = "vibetun-dns-direct"
     /** Резолвер домена DoH-сервера: IP-литерал, поэтому сам резолвер не нужен. */
     private const val DNS_DIRECT_RESOLVER_TAG = "vibetun-dns-direct-resolver"
-    private const val BLOCK_TAG = "vibetun-block"
-    /** Outbound типа dns: сюда уходят DNS-запросы из TUN (перехват для sing-box < 1.11). */
-    private const val DNS_OUT_TAG = "vibetun-dns-out"
     private val SECRET_KEYS = setOf("password", "uuid", "private_key", "pre_shared_key", "auth_str", "auth")
 
-    /** QUIC (UDP/443) блокируем: у нашего ядра (форк NekoBox) QUIC-relay через
-     *  туннель на части серверов мёртв — без блокировки браузеры не откатываются
-     *  на TCP и ничего не грузят. TCP-fallback работает предсказуемо. */
+    /** QUIC (UDP/443) блокируем: на части серверов QUIC-relay через туннель мёртв,
+     *  а TCP-fallback работает предсказуемо. В sing-box 1.14 блокировка — rule action. */
     private fun quicBlockRule(): JSONObject =
-        JSONObject().put("network", "udp").put("port", 443).put("outbound", BLOCK_TAG)
-
-    private fun blockOutbound(): JSONObject =
-        JSONObject().put("type", "block").put("tag", BLOCK_TAG)
+        JSONObject().put("network", "udp").put("port", 443).put("action", "reject")
 
     fun build(
         profile: ProxyProfile,
@@ -36,8 +32,10 @@ object SingBoxConfigBuilder {
         selectedAppsOnly: Boolean = false,
         directPackages: Set<String> = emptySet(),
         routeRules: List<RouteRule> = emptyList(),
+        tunMtu: Int = DEFAULT_TUN_MTU,
     ): String {
         require(profile.source.isNotBlank()) { "У профиля нет исходной ссылки или конфигурации." }
+        require(tunMtu in MIN_TUN_MTU..MAX_TUN_MTU) { "MTU туннеля должен быть в диапазоне $MIN_TUN_MTU–$MAX_TUN_MTU." }
         val packageList = selectedPackages.asSequence()
             .filter { it.isNotBlank() }
             .filterNot { it == "com.vibetun.app" }
@@ -54,50 +52,59 @@ object SingBoxConfigBuilder {
         if (selectedAppsOnly) {
             require(packageList.isNotEmpty()) { "Для режима «Выбранные приложения» отметьте хотя бы одно приложение." }
         }
+        // Снятые в интерфейсе галочки не попадают ни в route, ни в DNS-правила.
+        val activeRules = routeRules.filter { it.enabled }
 
         val source = profile.source.trim()
         if (source.startsWith("{")) {
             val json = runCatching { JSONObject(source) }
                 .getOrElse { throw IllegalArgumentException("Некорректный JSON-конфиг: ${it.message}") }
-            if (json.has("outbounds")) {
-                return normalizeFullConfig(json, packageList, selectedAppsOnly, directList, routeRules).toString()
+            if (json.has("outbounds") || json.has("endpoints")) {
+                return normalizeFullConfig(json, packageList, selectedAppsOnly, directList, activeRules, tunMtu).toString()
             }
             val type = json.optString("type").ifBlank { json.optString("protocol") }
-            require(type.isNotBlank()) { "В JSON не найден тип прокси или список outbounds." }
+            require(type.isNotBlank()) { "В JSON не найден тип прокси или список outbounds/endpoints." }
             val outbound = JSONObject(json.toString()).put("type", type).put("tag", PROXY_TAG)
-            return createServiceConfig(outbound, packageList, selectedAppsOnly, directList, routeRules).toString()
+            return createServiceConfig(outbound, packageList, selectedAppsOnly, directList, activeRules, tunMtu).toString()
         }
         require(!source.startsWith("[") || source.contains("[Interface]", ignoreCase = true)) {
-            "JSON-массив не является конфигурацией sing-box. Нужен объект с outbounds или профиль-ссылка."
+            "JSON-массив не является конфигурацией sing-box. Нужен объект с outbounds/endpoints или профиль-ссылка."
         }
         val outbound = createOutbound(profile.protocol, source)
-        return createServiceConfig(outbound, packageList, selectedAppsOnly, directList, routeRules).toString()
+        return createServiceConfig(outbound, packageList, selectedAppsOnly, directList, activeRules, tunMtu).toString()
     }
 
     /**
      * Минимальный конфиг для замера задержки профиля: локальный mixed-inbound (HTTP/SOCKS
-     * на 127.0.0.1) + исходящий outbound профиля. Замер = время HTTP-204 через этот прокси,
-     * так честно измеряются и UDP-протоколы (hysteria2/tuic), на которые TCP-ping не отвечает.
-     * null — протокол не поддерживается ядром sing-box (amneziawg) или некорректный источник.
+     * на 127.0.0.1) + исходящий outbound/endpoint профиля. Замер = время HTTP-204 через прокси.
      */
     fun buildProbeConfig(profile: ProxyProfile, port: Int): String? = runCatching {
         val source = profile.source.trim()
-        val outbound = if (source.startsWith("{")) {
+        val proxy = if (source.startsWith("{")) {
             val json = JSONObject(source)
-            val outbounds = json.optJSONArray("outbounds") ?: return null
-            (0 until outbounds.length())
-                .asSequence()
-                .mapNotNull { outbounds.optJSONObject(it) }
-                .firstOrNull { it.optString("type") !in setOf("direct", "block", "dns") }
-                ?: return null
+            if (json.has("outbounds") || json.has("endpoints")) {
+                firstProxy(normalizeLegacyConfig(json)) ?: return null
+            } else {
+                val type = json.optString("type").ifBlank { json.optString("protocol") }
+                if (type.isBlank()) return null
+                json.put("type", type)
+            }
         } else {
             val protocol = profile.protocol.trim()
             if (protocol.equals("amneziawg", ignoreCase = true)) return null
             createOutbound(protocol, source)
         }
-        outbound.put("tag", PROXY_TAG)
-        JSONObject()
+        proxy.put("tag", PROXY_TAG)
+        val config = JSONObject()
             .put("log", JSONObject().put("level", "panic"))
+            // Не пересекаемся с cache.db основного VPN: его bbolt держит эксклюзивную блокировку.
+            .put(
+                "experimental",
+                JSONObject().put(
+                    "cache_file",
+                    JSONObject().put("enabled", true).put("path", "probe-cache.db"),
+                ),
+            )
             .put(
                 "inbounds",
                 JSONArray().put(
@@ -108,9 +115,18 @@ object SingBoxConfigBuilder {
                         .put("listen_port", port),
                 ),
             )
-            .put("outbounds", JSONArray().put(outbound))
-            .put("route", JSONObject().put("auto_detect_interface", true).put("final", PROXY_TAG))
-            .toString()
+            .put(
+                "route",
+                JSONObject()
+                    .put("auto_detect_interface", true)
+                    .put("default_domain_resolver", DNS_DIRECT_TAG)
+                    .put("final", PROXY_TAG),
+            )
+            .put("dns", JSONObject().put("servers", createDnsServers()).put("final", DNS_TAG))
+        putProxy(config, proxy)
+        (config.optJSONArray("outbounds") ?: JSONArray().also { config.put("outbounds", it) })
+            .put(JSONObject().put("type", "direct").put("tag", DIRECT_TAG))
+        config.toString()
     }.getOrNull()
 
     private fun createServiceConfig(
@@ -119,25 +135,22 @@ object SingBoxConfigBuilder {
         selectedAppsOnly: Boolean,
         directPackages: List<String>,
         routeRules: List<RouteRule>,
+        tunMtu: Int,
     ): JSONObject {
         proxy.put("tag", PROXY_TAG)
+        migrateDialFields(proxy)
         val config = JSONObject()
         // debug в файле ядра: нужен для диагностики обрывов (DNS, закрытия соединений).
-        // В AppLog/logcat debug-строки не попадают (фильтр в writeLog).
         config.put("log", JSONObject().put("level", "debug").put("output", "logs/core.log").put("timestamp", true))
-        config.put("inbounds", JSONArray().put(createTunInbound(packages, selectedAppsOnly, directPackages)))
-        config.put(
-            "outbounds",
-            JSONArray()
-                .put(proxy)
-                .put(JSONObject().put("type", "direct").put("tag", DIRECT_TAG))
-                .put(blockOutbound())
-                .put(dnsOutbound()),
-        )
+        config.put("inbounds", JSONArray().put(createTunInbound(packages, selectedAppsOnly, directPackages, tunMtu)))
+        putProxy(config, proxy)
+        (config.optJSONArray("outbounds") ?: JSONArray().also { config.put("outbounds", it) })
+            .put(JSONObject().put("type", "direct").put("tag", DIRECT_TAG))
         config.put(
             "route",
             JSONObject()
                 .put("auto_detect_interface", true)
+                .put("default_domain_resolver", DNS_DIRECT_TAG)
                 .put("rules", createRouteRules(routeRules, directPackages, if (selectedAppsOnly) packages else emptyList()))
                 .put("final", PROXY_TAG),
         )
@@ -145,17 +158,41 @@ object SingBoxConfigBuilder {
             "dns",
             JSONObject()
                 .put("servers", createDnsServers())
-                .put("rules", createDnsRules(routeRules, listOfNotNull(proxy.optString("server")), directPackages))
+                .put("rules", createDnsRules(routeRules, proxyServerHosts(proxy), directPackages))
                 .put("final", DNS_TAG)
                 // IPv4-only: серверы в основном IPv4, AAAA-ответы заворачивают приложения
                 // на IPv6-адреса, которые через туннель не достижимы (YouTube вис).
                 .put("strategy", "ipv4_only")
-                // Обратное отображение IP→домен: если снифф не дал домен (ECH, кэш браузера),
-                // ядро восстанавливает его из собственного DNS-ответа, и доменные правила
-                // маршрутизации всё равно срабатывают.
                 .put("reverse_mapping", true),
         )
         return config
+    }
+
+    private fun putProxy(config: JSONObject, proxy: JSONObject) {
+        val collection = if (proxy.optString("type") == "wireguard") "endpoints" else "outbounds"
+        val items = config.optJSONArray(collection) ?: JSONArray().also { config.put(collection, it) }
+        items.put(proxy)
+    }
+
+    private fun firstProxy(config: JSONObject): JSONObject? {
+        for (collection in listOf("outbounds", "endpoints")) {
+            val items = config.optJSONArray(collection) ?: continue
+            for (index in 0 until items.length()) {
+                val item = items.optJSONObject(index) ?: continue
+                if (item.optString("type") !in setOf("direct", "block", "dns")) return item
+            }
+        }
+        return null
+    }
+
+    private fun proxyServerHosts(proxy: JSONObject): List<String> {
+        val result = mutableListOf<String>()
+        proxy.optString("server").takeIf { it.isNotBlank() }?.let(result::add)
+        val peers = proxy.optJSONArray("peers") ?: return result
+        for (index in 0 until peers.length()) {
+            peers.optJSONObject(index)?.optString("address")?.takeIf { it.isNotBlank() }?.let(result::add)
+        }
+        return result
     }
 
     private fun normalizeFullConfig(
@@ -164,15 +201,12 @@ object SingBoxConfigBuilder {
         selectedAppsOnly: Boolean,
         directPackages: List<String>,
         routeRules: List<RouteRule>,
+        tunMtu: Int,
     ): JSONObject {
-        val outbounds = config.optJSONArray("outbounds")
-            ?: throw IllegalArgumentException("В конфигурации отсутствует массив outbounds.")
-        require(outbounds.length() > 0) { "В конфигурации нет исходящих подключений (outbounds)." }
-        val hasBlockOutbound = (0 until outbounds.length())
-            .asSequence()
-            .mapNotNull { outbounds.optJSONObject(it) }
-            .any { it.optString("type") == "block" }
-        if (!hasBlockOutbound) outbounds.put(blockOutbound())
+        normalizeLegacyConfig(config)
+        val outbounds = config.optJSONArray("outbounds") ?: JSONArray().also { config.put("outbounds", it) }
+        val proxy = firstProxy(config)
+            ?: throw IllegalArgumentException("В конфигурации нет серверного outbound или endpoint.")
 
         var tun: JSONObject? = null
         val inbounds = config.optJSONArray("inbounds") ?: JSONArray()
@@ -184,26 +218,18 @@ object SingBoxConfigBuilder {
             }
         }
         if (tun == null) {
-            tun = createTunInbound(packages, selectedAppsOnly, directPackages)
+            tun = createTunInbound(packages, selectedAppsOnly, directPackages, tunMtu)
             inbounds.put(tun)
         } else {
             tun.put("auto_route", true)
             tun.put("strict_route", true)
-            if (!tun.has("inet4_address")) tun.put("inet4_address", JSONArray().put("172.19.0.1/30"))
-            // IPv4-only: inet6_address не добавляем — AAAA-трафик через IPv4-only серверы виснет
-            // Перезаписываем всегда: иначе в пользовательском JSON останутся чужие
-            // include/exclude_package, и per-app маршрутизация из настроек не сработает.
+            if (!tun.has("address")) tun.put("address", JSONArray().put("172.19.0.1/30"))
             if (selectedAppsOnly) tun.put("include_package", JSONArray(packages)) else tun.remove("include_package")
             if (directPackages.isNotEmpty()) tun.put("exclude_package", JSONArray(directPackages)) else tun.remove("exclude_package")
         }
-        // Android's system stack may try to bind sockets to the virtual IPv6 address and fail
-        // with EADDRNOTAVAIL. gVisor keeps the TCP/IP stack inside the process and avoids that.
-        tun.put("stack", "gvisor")
-        tun.put("sniff", true)
-        // sniff_override_destination намеренно НЕ ставим: см. комментарий в createTunInbound.
-        // Доменные правила работают через metadata.Domain (заполняется сниффом),
-        // ip_cidr — через исходный Destination.Addr.
-        tun.remove("sniff_override_destination")
+        // gVisor изолирует виртуальные адреса от системного IPv6-стека Android.
+        // Настройка приложения заменяет MTU и из импортированного полного JSON.
+        tun.put("stack", "gvisor").put("mtu", tunMtu)
         config.put("inbounds", inbounds)
         if (!config.has("log")) {
             config.put("log", JSONObject().put("level", "info").put("output", "logs/core.log").put("timestamp", true))
@@ -211,59 +237,214 @@ object SingBoxConfigBuilder {
 
         val route = config.optJSONObject("route") ?: JSONObject()
         if (!route.has("final") || route.optString("final").isBlank()) {
-            val proxyTag = (0 until outbounds.length())
-                .asSequence()
-                .mapNotNull { outbounds.optJSONObject(it) }
-                .firstOrNull { it.optString("type") !in setOf("direct", "block", "dns") }
-                ?.optString("tag")
-                .orEmpty()
+            val proxyTag = proxy.optString("tag")
             require(proxyTag.isNotBlank()) {
-                "Нельзя выбрать маршрут: назначьте тег серверного outbound и route.final в JSON-конфиге."
+                "Нельзя выбрать маршрут: назначьте тег серверного outbound/endpoint и route.final в JSON-конфиге."
             }
             route.put("final", proxyTag)
         }
         route.put("auto_detect_interface", true)
-        // PROXY-правила ссылаются на реальный серверный outbound (route.final), а не на
-        // константу PROXY_TAG — в пользовательском JSON теги свои, «vibetun-proxy» нет.
+        if (!route.has("default_domain_resolver")) route.put("default_domain_resolver", DNS_DIRECT_TAG)
         val actualProxyTag = route.optString("final")
         val userRules = createRouteRules(routeRules, directPackages, if (selectedAppsOnly) packages else emptyList(), proxyOutbound = actualProxyTag)
         val existingRules = route.optJSONArray("rules") ?: JSONArray()
         val mergedRules = JSONArray()
         for (index in 0 until userRules.length()) mergedRules.put(userRules.getJSONObject(index))
         for (index in 0 until existingRules.length()) mergedRules.put(existingRules.getJSONObject(index))
-        if (mergedRules.length() > 0) route.put("rules", mergedRules)
+        route.put("rules", mergedRules)
         config.put("route", route)
 
-        // Служебные outbound'ы, на которые ссылаются наши правила DNS и маршрутизации.
-        val hasTag = { tag: String ->
-            (0 until outbounds.length()).any { outbounds.optJSONObject(it)?.optString("tag") == tag }
+        val hasDirect = (0 until outbounds.length()).any {
+            outbounds.optJSONObject(it)?.optString("tag") == DIRECT_TAG
         }
-        if (!hasTag(DIRECT_TAG)) outbounds.put(JSONObject().put("type", "direct").put("tag", DIRECT_TAG))
-        if (!hasTag(DNS_OUT_TAG)) outbounds.put(dnsOutbound())
-        normalizeFullDns(config, outbounds)
+        if (!hasDirect) outbounds.put(JSONObject().put("type", "direct").put("tag", DIRECT_TAG))
+        normalizeFullDns(config)
         return config
     }
 
-    /**
-     * DNS для полного JSON: перехват через dns-outbound уже есть в правилах маршрутизации;
-     * здесь добавляем прямой DNS-сервер и bootstrap-правила для доменов серверов профилей.
-     */
-    private fun normalizeFullDns(config: JSONObject, outbounds: JSONArray) {
-        val serverHosts = (0 until outbounds.length())
-            .mapNotNull { outbounds.optJSONObject(it) }
-            .filterNot { it.optString("type") in setOf("direct", "block", "dns") }
-            .map { it.optString("server") }
-            .filter { it.isNotBlank() }
+    /** Миграция полей, удалённых из sing-box 1.14, для ранее импортированных JSON-профилей. */
+    private fun normalizeLegacyConfig(config: JSONObject): JSONObject {
+        val blockTags = mutableSetOf<String>()
+        val dnsTags = mutableSetOf<String>()
+        val oldOutbounds = config.optJSONArray("outbounds") ?: JSONArray()
+        val outbounds = JSONArray()
+        val endpoints = config.optJSONArray("endpoints") ?: JSONArray()
+        for (index in 0 until oldOutbounds.length()) {
+            val outbound = oldOutbounds.optJSONObject(index) ?: continue
+            when (outbound.optString("type")) {
+                "block" -> outbound.optString("tag").takeIf { it.isNotBlank() }?.let(blockTags::add)
+                "dns" -> outbound.optString("tag").takeIf { it.isNotBlank() }?.let(dnsTags::add)
+                "wireguard" -> endpoints.put(wireGuardEndpoint(outbound))
+                else -> {
+                    migrateDialFields(outbound)
+                    outbounds.put(outbound)
+                }
+            }
+        }
+        for (index in 0 until endpoints.length()) endpoints.optJSONObject(index)?.let(::migrateDialFields)
+        config.put("outbounds", outbounds)
+        if (endpoints.length() > 0) config.put("endpoints", endpoints)
+
+        val route = config.optJSONObject("route")
+        val routeRules = route?.optJSONArray("rules")
+        if (routeRules != null) {
+            for (index in 0 until routeRules.length()) {
+                val rule = routeRules.optJSONObject(index) ?: continue
+                when (rule.optString("outbound")) {
+                    in blockTags -> rule.remove("outbound").let { rule.put("action", "reject") }
+                    in dnsTags -> rule.remove("outbound").let { rule.put("action", "hijack-dns") }
+                }
+            }
+        }
+
+        val inbounds = config.optJSONArray("inbounds")
+        if (inbounds != null) {
+            for (index in 0 until inbounds.length()) {
+                val inbound = inbounds.optJSONObject(index) ?: continue
+                inbound.remove("sniff")
+                inbound.remove("sniff_timeout")
+                inbound.remove("sniff_override_destination")
+                inbound.remove("domain_strategy")
+                if (inbound.optString("type") == "tun") {
+                    mergeJsonFields(inbound, "address", "inet4_address", "inet6_address")
+                    mergeJsonFields(inbound, "route_address", "inet4_route_address", "inet6_route_address")
+                    mergeJsonFields(inbound, "route_exclude_address", "inet4_route_exclude_address", "inet6_route_exclude_address")
+                }
+            }
+        }
+
+        val servers = config.optJSONObject("dns")?.optJSONArray("servers")
+        if (servers != null) {
+            for (index in 0 until servers.length()) {
+                servers.optJSONObject(index)?.let(::migrateDnsServer)
+            }
+        }
+        return config
+    }
+
+    private fun mergeJsonFields(target: JSONObject, newName: String, vararg oldNames: String) {
+        if (target.has(newName)) {
+            oldNames.forEach(target::remove)
+            return
+        }
+        val merged = JSONArray()
+        for (name in oldNames) {
+            val value = target.opt(name) ?: continue
+            if (value is JSONArray) {
+                for (index in 0 until value.length()) merged.put(value.get(index))
+            } else {
+                merged.put(value)
+            }
+            target.remove(name)
+        }
+        if (merged.length() > 0) target.put(newName, merged)
+    }
+
+    private fun migrateDialFields(outbound: JSONObject) {
+        val strategy = outbound.optString("domain_strategy")
+        outbound.remove("domain_strategy")
+        if (strategy.isNotBlank()) {
+            outbound.put(
+                "domain_resolver",
+                JSONObject().put("server", DNS_DIRECT_TAG).put("strategy", strategy),
+            )
+        }
+    }
+
+    private fun migrateDnsServer(server: JSONObject) {
+        if (server.has("address_resolver")) {
+            server.put("domain_resolver", server.optString("address_resolver"))
+            server.remove("address_resolver")
+        }
+        server.remove("address_strategy")
+        if (!server.has("address")) return
+        val address = server.optString("address")
+        server.remove("address")
+        if (address == "local") {
+            server.put("type", "local")
+            return
+        }
+        require(!address.startsWith("rcode:") && address != "fakeip") {
+            "DNS-сервер «$address» требует ручной миграции для sing-box 1.14."
+        }
+        val withScheme = if (address.contains("://")) address else "udp://$address"
+        val uri = parseUri(withScheme)
+        server.put("type", uri.scheme.lowercase())
+        server.put("server", uri.host.orEmpty())
+        if (uri.port > 0) server.put("server_port", uri.port)
+        if (uri.scheme.equals("https", true) || uri.scheme.equals("h3", true)) {
+            if (!uri.rawPath.isNullOrBlank()) server.put("path", uri.rawPath)
+        }
+    }
+
+    private fun wireGuardEndpoint(outbound: JSONObject): JSONObject {
+        val endpoint = JSONObject(outbound.toString())
+        if (!endpoint.has("address")) {
+            endpoint.put("address", endpoint.opt("local_address") ?: JSONArray())
+        }
+        endpoint.remove("local_address")
+        if (endpoint.has("system_interface")) {
+            endpoint.put("system", endpoint.optBoolean("system_interface"))
+            endpoint.remove("system_interface")
+        }
+        if (endpoint.has("interface_name")) {
+            endpoint.put("name", endpoint.optString("interface_name"))
+            endpoint.remove("interface_name")
+        }
+        val peers = endpoint.optJSONArray("peers") ?: JSONArray().also { endpoint.put("peers", it) }
+        if (peers.length() == 0) {
+            peers.put(
+                JSONObject()
+                    .put("address", endpoint.optString("server"))
+                    .put("port", endpoint.optInt("server_port"))
+                    .put("public_key", endpoint.optString("peer_public_key"))
+                    .apply {
+                        endpoint.optString("pre_shared_key").takeIf { it.isNotBlank() }?.let { put("pre_shared_key", it) }
+                        endpoint.optJSONArray("allowed_ips")?.let { put("allowed_ips", it) }
+                        endpoint.optJSONArray("reserved")?.let { put("reserved", it) }
+                    },
+            )
+        }
+        for (index in 0 until peers.length()) {
+            val peer = peers.optJSONObject(index) ?: continue
+            if (peer.has("server")) {
+                peer.put("address", peer.optString("server"))
+                peer.remove("server")
+            }
+            if (peer.has("server_port")) {
+                peer.put("port", peer.optInt("server_port"))
+                peer.remove("server_port")
+            }
+        }
+        listOf("server", "server_port", "peer_public_key", "pre_shared_key", "allowed_ips", "reserved").forEach(endpoint::remove)
+        return endpoint
+    }
+
+    /** DNS для полного JSON: добавляем прямой сервер и bootstrap доменов профилей. */
+    private fun normalizeFullDns(config: JSONObject) {
+        val serverHosts = mutableListOf<String>()
+        for (collection in listOf("outbounds", "endpoints")) {
+            val items = config.optJSONArray(collection) ?: continue
+            for (index in 0 until items.length()) {
+                val item = items.optJSONObject(index) ?: continue
+                if (item.optString("type") !in setOf("direct", "block", "dns")) {
+                    serverHosts += proxyServerHosts(item)
+                }
+            }
+        }
+        val routeFinal = config.getJSONObject("route").getString("final")
         val dns = config.optJSONObject("dns") ?: JSONObject()
             .put("servers", createDnsServers())
             .put("final", DNS_TAG)
             .put("strategy", "ipv4_only")
         if (!dns.has("reverse_mapping")) dns.put("reverse_mapping", true)
         val servers = dns.optJSONArray("servers") ?: JSONArray().also { dns.put("servers", it) }
+        for (index in 0 until servers.length()) {
+            val server = servers.optJSONObject(index) ?: continue
+            if (server.optString("tag") == DNS_TAG) server.put("detour", routeFinal)
+        }
         val hasDirectServer = (0 until servers.length()).any { servers.optJSONObject(it)?.optString("tag") == DNS_DIRECT_TAG }
         if (!hasDirectServer) {
-            // resolver добавляем вместе с direct-сервером атомарно: у directDnsServer()
-            // address_resolver обязателен (DoH по доменному адресу), без него ядро отклоняет конфиг.
             servers.put(directDnsResolver())
             servers.put(directDnsServer())
         }
@@ -294,13 +475,13 @@ object SingBoxConfigBuilder {
      *  серверного outbound (тот же, что в route.final), чтобы правила не ссылались на
      *  несуществующий тег. */
     private fun createRouteRules(rules: List<RouteRule>, directPackages: List<String> = emptyList(), proxyPackages: List<String> = emptyList(), proxyOutbound: String = PROXY_TAG): JSONArray {
-        // DNS перехватываем первым правилом: иначе запросы уходят к final как обычный UDP
-        // на 172.19.0.2:53 и не получают ответа (sing-box 1.9 не перехватывает DNS сам).
+        // Sniff и DNS hijack в 1.14 — действия правил, а не поля inbound и dns-outbound.
         val merged = JSONArray()
-            .put(JSONObject().put("protocol", "dns").put("outbound", DNS_OUT_TAG))
-            .put(JSONObject().put("port", 53).put("outbound", DNS_OUT_TAG))
+            .put(JSONObject().put("action", "sniff"))
+            .put(JSONObject().put("protocol", "dns").put("action", "hijack-dns"))
+            .put(JSONObject().put("port", 53).put("action", "hijack-dns"))
             .put(quicBlockRule())
-        fun group(action: RouteAction, outbound: String) {
+        fun group(action: RouteAction, outbound: String?) {
             fun valuesOf(type: RouteRuleType): JSONArray = JSONArray().apply {
                 rules.filter { it.action == action && it.type == type }.forEach { rule ->
                     put(
@@ -315,10 +496,16 @@ object SingBoxConfigBuilder {
             val cidr = valuesOf(RouteRuleType.IP_CIDR)
             val suffix = valuesOf(RouteRuleType.DOMAIN_SUFFIX)
             val keyword = valuesOf(RouteRuleType.KEYWORD)
-            if (cidr.length() > 0) merged.put(JSONObject().put("ip_cidr", cidr).put("outbound", outbound))
-            if (suffix.length() > 0) merged.put(JSONObject().put("domain_suffix", suffix).put("outbound", outbound))
-            if (keyword.length() > 0) merged.put(JSONObject().put("domain_regex", keyword).put("outbound", outbound))
+            fun condition(key: String, values: JSONArray): JSONObject = JSONObject().put(key, values).apply {
+                // В sing-box 1.14 блокировка — действие reject, block-outbound удалён.
+                if (outbound == null) put("action", "reject") else put("outbound", outbound)
+            }
+            if (cidr.length() > 0) merged.put(condition("ip_cidr", cidr))
+            if (suffix.length() > 0) merged.put(condition("domain_suffix", suffix))
+            if (keyword.length() > 0) merged.put(condition("domain_regex", keyword))
         }
+        // BLOCK стоит раньше более общих DIRECT/PROXY-правил.
+        group(RouteAction.BLOCK, null)
         group(RouteAction.DIRECT, DIRECT_TAG)
         group(RouteAction.PROXY, proxyOutbound)
         // Per-app маршрут — после доменных/IP (см. комментарий к функции): ядро определяет
@@ -339,29 +526,30 @@ object SingBoxConfigBuilder {
         return if (value.contains(':')) "$value/128" else "$value/32"
     }
 
-    private fun dnsOutbound(): JSONObject = JSONObject().put("type", "dns").put("tag", DNS_OUT_TAG)
-
-    // НЕ «local»: на Android он ходит в системный DNS аплинка, который бывает сломан
-    // (логи: exchange failed ... name error для ozon.ru) и не умеет HTTPS-записи
-    // (no raw query support by current transport). Яндекс-DoH идёт напрямую и стабилен.
-    // Домен DoH-сервера резолвится через address_resolver с IP-литералом (требование sing-box).
+    // НЕ «local»: на Android системный DNS аплинка бывает сломан. Яндекс-DoH идёт
+    // напрямую, а домен его адреса разрешается через отдельный UDP-резолвер с IP-литералом.
+    // В sing-box 1.14 DNS без detour уже использует прямой dialer. Явный detour на пустой
+    // direct-outbound теперь отклоняется ядром: "empty direct outbound makes no sense".
     private fun directDnsServer(): JSONObject = JSONObject()
+        .put("type", "https")
         .put("tag", DNS_DIRECT_TAG)
-        .put("address", "https://common.dot.dns.yandex.net/dns-query")
-        .put("address_resolver", DNS_DIRECT_RESOLVER_TAG)
-        .put("detour", DIRECT_TAG)
+        .put("server", "common.dot.dns.yandex.net")
+        .put("path", "/dns-query")
+        .put("domain_resolver", DNS_DIRECT_RESOLVER_TAG)
 
     private fun directDnsResolver(): JSONObject = JSONObject()
+        .put("type", "udp")
         .put("tag", DNS_DIRECT_RESOLVER_TAG)
-        .put("address", "77.88.8.8")
-        .put("detour", DIRECT_TAG)
+        .put("server", "77.88.8.8")
 
     /** Всегда есть прямой DNS: без него доменный адрес сервера резолвится через ещё не поднятый прокси. */
     private fun createDnsServers(): JSONArray = JSONArray().apply {
         put(
             JSONObject()
+                .put("type", "https")
                 .put("tag", DNS_TAG)
-                .put("address", "https://1.1.1.1/dns-query")
+                .put("server", "1.1.1.1")
+                .put("path", "/dns-query")
                 .put("detour", PROXY_TAG),
         )
         put(directDnsResolver())
@@ -405,26 +593,16 @@ object SingBoxConfigBuilder {
         return result.put(rule)
     }
 
-    private fun createTunInbound(packages: List<String>, selectedAppsOnly: Boolean, directPackages: List<String>): JSONObject {
+    private fun createTunInbound(packages: List<String>, selectedAppsOnly: Boolean, directPackages: List<String>, tunMtu: Int): JSONObject {
         val tun = JSONObject()
             .put("type", "tun")
             .put("tag", TUN_TAG)
-            .put("inet4_address", JSONArray().put("172.19.0.1/30"))
-            // gVisor + MTU 9000 (как в Hiddify): QUIC-транспорты (hysteria2/tuic) сами
-            // режут датаграммы по своему PMTU; маленький MTU тут давал фрагментацию
-            // внешнего UDP и зависание крупных передач (видео YouTube — не грузилось,
-            // превью и TCP-сервисы — работали).
-            .put("mtu", 9000)
+            .put("address", JSONArray().put("172.19.0.1/30"))
+            // Sniff перенесён в route.rules для sing-box 1.14.
+            .put("mtu", tunMtu)
             .put("auto_route", true)
             .put("strict_route", true)
             .put("stack", "gvisor")
-            .put("sniff", true)
-            // sniff=true: домен из TLS/HTTP-сниффа заполняет metadata.Domain, и доменные
-            // правила (DomainItem) матчатся через него, а не через Destination.Fqdn.
-            // sniff_override_destination НЕ ставим: при override Destination подменяется
-            // на FQDN, и ip_cidr-правила теряют исходный IP (DestinationAddresses пуст,
-            // domain_strategy не задан). Без override Destination остаётся исходным IP —
-            // ip_cidr матчится штатно, а доменные правила работают через metadata.Domain.
         if (selectedAppsOnly) tun.put("include_package", JSONArray(packages))
         if (directPackages.isNotEmpty()) tun.put("exclude_package", JSONArray(directPackages))
         return tun
@@ -436,16 +614,13 @@ object SingBoxConfigBuilder {
         if (scheme == "ss") return createShadowsocks(source)
         if (scheme == "wg" || scheme == "wireguard") return createWireGuardLink(source)
         if (scheme == "awg" || scheme == "amneziawg" || protocol.equals("amneziawg", ignoreCase = true)) {
-            throw IllegalArgumentException("AmneziaWG не входит в Android-сборку sing-box 1.9.7; импорт профиля сохранён, но подключение невозможно.")
+            throw IllegalArgumentException("AmneziaWG обрабатывается отдельным Android-движком, а не sing-box.")
         }
         if (scheme == "ssr") {
             throw IllegalArgumentException("ShadowsocksR (SSR) не поддерживается используемым ядром sing-box.")
         }
         if (scheme == "tg" || protocol.equals("mtproto", ignoreCase = true)) {
             throw IllegalArgumentException("MTProto предназначен только для Telegram и не является TUN-прокси общего назначения.")
-        }
-        if (protocol.equals("anytls", ignoreCase = true) || scheme == "anytls") {
-            throw IllegalArgumentException("AnyTLS отсутствует в Android-сборке sing-box 1.9.7.")
         }
         if (protocol.equals("wireguard", ignoreCase = true) && source.contains("[Interface]", ignoreCase = true) && source.contains("PrivateKey", ignoreCase = true)) {
             return createWireGuardConfig(source)
@@ -542,6 +717,11 @@ object SingBoxConfigBuilder {
                 // серверы отклоняют такое согласование, а спек-совместимого смысла в нём нет.
                 outbound.optJSONObject("tls")?.put("alpn", JSONArray().put("h3"))
             }
+            "anytls" -> {
+                outbound.put("type", "anytls")
+                outbound.put("password", password.ifBlank { username.ifBlank { userInfo } })
+                applyTls(outbound, query, host, force = true)
+            }
             "ssh" -> {
                 outbound.put("type", "ssh")
                 outbound.put("user", query["user"] ?: username.ifBlank { "root" })
@@ -627,17 +807,15 @@ object SingBoxConfigBuilder {
             ?: throw IllegalArgumentException("В WireGuard-ссылке отсутствует локальный address.")
         val allowed = query.firstOf("allowedIPs", "allowed_ips") ?: "0.0.0.0/0,::/0"
         val peer = JSONObject()
-            .put("server", uri.host.orEmpty())
-            .put("server_port", uri.port.takeIf { it > 0 } ?: 51820)
+            .put("address", uri.host.orEmpty())
+            .put("port", uri.port.takeIf { it > 0 } ?: 51820)
             .put("public_key", peerKey)
             .put("allowed_ips", splitList(allowed))
         query.firstOf("preSharedKey", "pre_shared_key")?.let { peer.put("pre_shared_key", it) }
         return JSONObject()
             .put("type", "wireguard")
             .put("tag", PROXY_TAG)
-            .put("server", uri.host.orEmpty())
-            .put("server_port", uri.port.takeIf { it > 0 } ?: 51820)
-            .put("local_address", splitList(address))
+            .put("address", splitList(address))
             .put("private_key", privateKey)
             .put("peers", JSONArray().put(peer))
             .also { query["mtu"]?.toIntOrNull()?.let { mtu -> it.put("mtu", mtu) } }
@@ -654,26 +832,22 @@ object SingBoxConfigBuilder {
         }
         require(peers.isNotEmpty()) { "В WireGuard-конфигурации нет секции [Peer]." }
         val peerArray = JSONArray()
-        var defaultServer: Pair<String, Int>? = null
         peers.forEach { peer ->
             val endpoint = parseAuthority(peer["endpoint"].orEmpty())
             require(endpoint.first.isNotBlank()) { "В секции [Peer] не указан Endpoint." }
-            if (defaultServer == null) defaultServer = endpoint
             val item = JSONObject()
-                .put("server", endpoint.first)
-                .put("server_port", endpoint.second)
+                .put("address", endpoint.first)
+                .put("port", endpoint.second)
                 .put("public_key", peer["publickey"].orEmpty())
                 .put("allowed_ips", splitList(peer["allowedips"] ?: "0.0.0.0/0,::/0"))
             peer["presharedkey"]?.takeIf { it.isNotBlank() }?.let { item.put("pre_shared_key", it) }
+            peer["persistentkeepalive"]?.toIntOrNull()?.let { item.put("persistent_keepalive_interval", it) }
             peerArray.put(item)
         }
-        val server = checkNotNull(defaultServer)
         val outbound = JSONObject()
             .put("type", "wireguard")
             .put("tag", PROXY_TAG)
-            .put("server", server.first)
-            .put("server_port", server.second)
-            .put("local_address", splitList(addresses))
+            .put("address", splitList(addresses))
             .put("private_key", privateKey)
             .put("peers", peerArray)
         iface["mtu"]?.toIntOrNull()?.let { outbound.put("mtu", it) }
@@ -739,7 +913,7 @@ object SingBoxConfigBuilder {
                 .put("path", path)
                 .apply { if (!host.isNullOrBlank()) put("host", host) }
             "quic" -> JSONObject().put("type", "quic")
-            else -> throw IllegalArgumentException("Транспорт $type не поддерживается sing-box 1.9.7.")
+            else -> throw IllegalArgumentException("Транспорт $type не поддерживается sing-box 1.14.4.")
         }
         outbound.put("transport", transport)
     }

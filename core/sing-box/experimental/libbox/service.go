@@ -2,111 +2,43 @@ package libbox
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"net"
 	"net/netip"
-	"os"
 	"runtime"
-	runtimeDebug "runtime/debug"
+	"strconv"
+	"sync"
 	"syscall"
-	"time"
 
-	"github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/process"
-	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/experimental/libbox/internal/procfs"
-	"github.com/sagernet/sing-box/experimental/libbox/platform"
-	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-box/service/powerreport"
+	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
-	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/service"
-	"github.com/sagernet/sing/service/filemanager"
-	"github.com/sagernet/sing/service/pause"
 )
 
-type BoxService struct {
-	ctx                   context.Context
-	cancel                context.CancelFunc
-	instance              *box.Box
-	pauseManager          pause.Manager
-	urlTestHistoryStorage *urltest.HistoryStorage
-
-	servicePauseFields
-}
-
-func NewService(configContent string, platformInterface PlatformInterface) (*BoxService, error) {
-	options, err := parseConfig(configContent)
-	if err != nil {
-		return nil, err
-	}
-	runtimeDebug.FreeOSMemory()
-	ctx, cancel := context.WithCancel(context.Background())
-	ctx = filemanager.WithDefault(ctx, sWorkingPath, sTempPath, sUserID, sGroupID)
-	urlTestHistoryStorage := urltest.NewHistoryStorage()
-	ctx = service.ContextWithPtr(ctx, urlTestHistoryStorage)
-	platformWrapper := &platformInterfaceWrapper{iif: platformInterface, useProcFS: platformInterface.UseProcFS()}
-	instance, err := box.New(box.Options{
-		Context:           ctx,
-		Options:           options,
-		PlatformInterface: platformWrapper,
-		PlatformLogWriter: platformWrapper,
-	})
-	if err != nil {
-		cancel()
-		return nil, E.Cause(err, "create service")
-	}
-	runtimeDebug.FreeOSMemory()
-	return &BoxService{
-		ctx:                   ctx,
-		cancel:                cancel,
-		instance:              instance,
-		urlTestHistoryStorage: urlTestHistoryStorage,
-		pauseManager:          service.FromContext[pause.Manager](ctx),
-	}, nil
-}
-
-func (s *BoxService) Start() error {
-	return s.instance.Start()
-}
-
-func (s *BoxService) Close() error {
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-done:
-			return
-		case <-time.After(C.FatalStopTimeout):
-			os.Exit(1)
-		}
-	}()
-	s.cancel()
-	s.urlTestHistoryStorage.Close()
-	return s.instance.Close()
-}
-
-func (s *BoxService) NeedWIFIState() bool {
-	return s.instance.Router().NeedWIFIState()
-}
-
-var (
-	_ platform.Interface = (*platformInterfaceWrapper)(nil)
-	_ log.PlatformWriter = (*platformInterfaceWrapper)(nil)
-)
+var _ adapter.PlatformInterface = (*platformInterfaceWrapper)(nil)
 
 type platformInterfaceWrapper struct {
-	iif       PlatformInterface
-	useProcFS bool
-	router    adapter.Router
+	iif                    PlatformInterface
+	networkManager         adapter.NetworkManager
+	powerManager           *powerreport.Manager
+	myTunName              string
+	myTunAddress           []netip.Addr
+	defaultInterfaceAccess sync.Mutex
+	defaultInterface       *control.Interface
+	isExpensive            bool
+	isConstrained          bool
 }
 
-func (w *platformInterfaceWrapper) Initialize(ctx context.Context, router adapter.Router) error {
-	w.router = router
+func (w *platformInterfaceWrapper) Initialize(networkManager adapter.NetworkManager) error {
+	w.networkManager = networkManager
 	return nil
 }
 
@@ -114,20 +46,20 @@ func (w *platformInterfaceWrapper) UsePlatformAutoDetectInterfaceControl() bool 
 	return w.iif.UsePlatformAutoDetectInterfaceControl()
 }
 
-func (w *platformInterfaceWrapper) AutoDetectInterfaceControl() control.Func {
-	return func(network, address string, conn syscall.RawConn) error {
-		return control.Raw(conn, func(fd uintptr) error {
-			return w.iif.AutoDetectInterfaceControl(int32(fd))
-		})
-	}
+func (w *platformInterfaceWrapper) AutoDetectInterfaceControl(fd int) error {
+	return w.iif.AutoDetectInterfaceControl(int32(fd))
 }
 
-func (w *platformInterfaceWrapper) OpenTun(options *tun.Options, platformOptions option.TunPlatformOptions) (tun.Tun, error) {
+func (w *platformInterfaceWrapper) UsePlatformInterface() bool {
+	return true
+}
+
+func (w *platformInterfaceWrapper) OpenInterface(options *tun.Options, platformOptions option.TunPlatformOptions) (tun.Tun, error) {
 	if len(options.IncludeUID) > 0 || len(options.ExcludeUID) > 0 {
-		return nil, E.New("android: unsupported uid options")
+		return nil, E.New("platform: unsupported uid options")
 	}
 	if len(options.IncludeAndroidUser) > 0 {
-		return nil, E.New("android: unsupported android_user option")
+		return nil, E.New("platform: unsupported android_user option")
 	}
 	routeRanges, err := options.BuildAutoRouteRanges(true)
 	if err != nil {
@@ -141,71 +73,86 @@ func (w *platformInterfaceWrapper) OpenTun(options *tun.Options, platformOptions
 	if err != nil {
 		return nil, E.Cause(err, "query tun name")
 	}
+	options.InterfaceMonitor.RegisterMyInterface(options.Name)
 	dupFd, err := dup(int(tunFd))
 	if err != nil {
 		return nil, E.Cause(err, "dup tun file descriptor")
 	}
 	options.FileDescriptor = dupFd
+	w.myTunName = options.Name
+	w.myTunAddress = myTunAddress(options)
+	w.iif.RegisterMyInterface(options.Name)
 	return tun.New(*options)
 }
 
-func (w *platformInterfaceWrapper) FindProcessInfo(ctx context.Context, network string, source netip.AddrPort, destination netip.AddrPort) (*process.Info, error) {
-	var uid int32
-	if w.useProcFS {
-		uid = procfs.ResolveSocketByProcSearch(network, source, destination)
-		if uid == -1 {
-			return nil, E.New("procfs: not found")
-		}
-	} else {
-		var ipProtocol int32
-		switch N.NetworkName(network) {
-		case N.NetworkTCP:
-			ipProtocol = syscall.IPPROTO_TCP
-		case N.NetworkUDP:
-			ipProtocol = syscall.IPPROTO_UDP
-		default:
-			return nil, E.New("unknown network: ", network)
-		}
-		var err error
-		uid, err = w.iif.FindConnectionOwner(ipProtocol, source.Addr().String(), int32(source.Port()), destination.Addr().String(), int32(destination.Port()))
-		if err != nil {
-			return nil, err
-		}
+func (w *platformInterfaceWrapper) ProcessPlatformOptions(options option.TunPlatformOptions) error {
+	return nil
+}
+
+func myTunAddress(options *tun.Options) []netip.Addr {
+	addresses := make([]netip.Addr, 0, len(options.Inet4Address)+len(options.Inet6Address))
+	for _, prefix := range options.Inet4Address {
+		addresses = append(addresses, prefix.Addr())
 	}
-	packageName, _ := w.iif.PackageNameByUid(uid)
-	return &process.Info{UserId: uid, PackageName: packageName}, nil
+	for _, prefix := range options.Inet6Address {
+		addresses = append(addresses, prefix.Addr())
+	}
+	return addresses
+}
+
+func (w *platformInterfaceWrapper) MyInterfaceAddress() []netip.Addr {
+	return w.myTunAddress
 }
 
 func (w *platformInterfaceWrapper) UsePlatformDefaultInterfaceMonitor() bool {
-	return w.iif.UsePlatformDefaultInterfaceMonitor()
+	return true
 }
 
 func (w *platformInterfaceWrapper) CreateDefaultInterfaceMonitor(logger logger.Logger) tun.DefaultInterfaceMonitor {
 	return &platformDefaultInterfaceMonitor{
 		platformInterfaceWrapper: w,
-		defaultInterfaceIndex:    -1,
 		logger:                   logger,
 	}
 }
 
-func (w *platformInterfaceWrapper) UsePlatformInterfaceGetter() bool {
-	return w.iif.UsePlatformInterfaceGetter()
+func (w *platformInterfaceWrapper) UsePlatformNetworkInterfaces() bool {
+	return true
 }
 
-func (w *platformInterfaceWrapper) Interfaces() ([]control.Interface, error) {
+func (w *platformInterfaceWrapper) NetworkInterfaces() ([]adapter.NetworkInterface, error) {
 	interfaceIterator, err := w.iif.GetInterfaces()
 	if err != nil {
 		return nil, err
 	}
-	var interfaces []control.Interface
+	var interfaces []adapter.NetworkInterface
 	for _, netInterface := range iteratorToArray[*NetworkInterface](interfaceIterator) {
-		interfaces = append(interfaces, control.Interface{
-			Index:     int(netInterface.Index),
-			MTU:       int(netInterface.MTU),
-			Name:      netInterface.Name,
-			Addresses: common.Map(iteratorToArray[string](netInterface.Addresses), netip.MustParsePrefix),
+		w.defaultInterfaceAccess.Lock()
+		// (GOOS=windows) SA4006: this value of `isDefault` is never used
+		// Why not used?
+		//nolint:staticcheck
+		isDefault := netInterface.Name != w.myTunName && w.defaultInterface != nil && int(netInterface.Index) == w.defaultInterface.Index
+		w.defaultInterfaceAccess.Unlock()
+		interfaces = append(interfaces, adapter.NetworkInterface{
+			Interface: control.Interface{
+				Index:     int(netInterface.Index),
+				MTU:       int(netInterface.MTU),
+				Name:      netInterface.Name,
+				Addresses: common.Map(iteratorToArray[string](netInterface.Addresses), netip.MustParsePrefix),
+				Flags:     linkFlags(uint32(netInterface.Flags)),
+			},
+			Type:       C.InterfaceType(netInterface.Type),
+			DNSServers: iteratorToArray[string](netInterface.DNSServer),
+			Gateways: common.Filter(common.Map(iteratorToArray[string](netInterface.Gateway), func(it string) netip.Addr {
+				gateway, _ := netip.ParseAddr(it)
+				return gateway.Unmap().WithZone("")
+			}), netip.Addr.IsValid),
+			Expensive:   netInterface.Metered || isDefault && w.isExpensive,
+			Constrained: isDefault && w.isConstrained,
 		})
 	}
+	interfaces = common.UniqBy(interfaces, func(it adapter.NetworkInterface) string {
+		return it.Name
+	})
 	return interfaces, nil
 }
 
@@ -213,7 +160,7 @@ func (w *platformInterfaceWrapper) UnderNetworkExtension() bool {
 	return w.iif.UnderNetworkExtension()
 }
 
-func (w *platformInterfaceWrapper) IncludeAllNetworks() bool {
+func (w *platformInterfaceWrapper) NetworkExtensionIncludeAllNetworks() bool {
 	return w.iif.IncludeAllNetworks()
 }
 
@@ -221,18 +168,223 @@ func (w *platformInterfaceWrapper) ClearDNSCache() {
 	w.iif.ClearDNSCache()
 }
 
-func (w *platformInterfaceWrapper) ReadWIFIState() adapter.WIFIState {
+func (w *platformInterfaceWrapper) RequestPermissionForWIFIState() error {
+	return nil
+}
+
+func (w *platformInterfaceWrapper) UsePlatformWIFIMonitor() bool {
+	return true
+}
+
+func (w *platformInterfaceWrapper) ReadWIFIState(ctx context.Context) adapter.WIFIState {
 	wifiState := w.iif.ReadWIFIState()
 	if wifiState == nil {
 		return adapter.WIFIState{}
 	}
-	return (adapter.WIFIState)(*wifiState)
+	return adapter.WIFIState(*wifiState)
+}
+
+func (w *platformInterfaceWrapper) UsePlatformConnectionOwnerFinder() bool {
+	return true
+}
+
+func (w *platformInterfaceWrapper) FindConnectionOwner(request *adapter.FindConnectionOwnerRequest) (*adapter.ConnectionOwner, error) {
+	result, err := w.iif.FindConnectionOwner(request.IpProtocol, request.SourceAddress, request.SourcePort, request.DestinationAddress, request.DestinationPort)
+	if err != nil {
+		return nil, err
+	}
+	return &adapter.ConnectionOwner{
+		UserId:              result.UserId,
+		UserName:            result.UserName,
+		ProcessPath:         result.ProcessPath,
+		AndroidPackageNames: result.androidPackageNames,
+	}, nil
 }
 
 func (w *platformInterfaceWrapper) DisableColors() bool {
 	return runtime.GOOS != "android"
 }
 
-func (w *platformInterfaceWrapper) WriteMessage(level log.Level, message string) {
-	w.iif.WriteLog(message)
+func (w *platformInterfaceWrapper) UsePlatformNotification() bool {
+	return true
+}
+
+func (w *platformInterfaceWrapper) SendNotification(notification *adapter.Notification) error {
+	return w.iif.SendNotification((*Notification)(notification))
+}
+
+func (w *platformInterfaceWrapper) CancelNotification(identifier string, typeID int32) error {
+	return w.iif.CancelNotification(identifier, typeID)
+}
+
+func (w *platformInterfaceWrapper) UsePlatformNeighborResolver() bool {
+	return true
+}
+
+func (w *platformInterfaceWrapper) StartNeighborMonitor(listener adapter.NeighborUpdateListener) error {
+	return w.iif.StartNeighborMonitor(&neighborUpdateListenerWrapper{listener: listener})
+}
+
+func (w *platformInterfaceWrapper) CloseNeighborMonitor(listener adapter.NeighborUpdateListener) error {
+	return w.iif.CloseNeighborMonitor(nil)
+}
+
+func (w *platformInterfaceWrapper) UsePlatformShell() bool {
+	return w.iif.UsePlatformShell()
+}
+
+func (w *platformInterfaceWrapper) CheckPlatformShell() error {
+	return w.iif.CheckPlatformShell()
+}
+
+func (w *platformInterfaceWrapper) OpenShellSession(user *adapter.PlatformUser, command string, environ []string, term string, rows int32, cols int32) (adapter.ShellSession, error) {
+	libboxUser := &PlatformUser{
+		Username: user.Username,
+		Uid:      int32(user.Uid),
+		Gid:      int32(user.Gid),
+		HomeDir:  user.HomeDir,
+		Shell:    user.Shell,
+	}
+	if len(user.Groups) > 0 {
+		libboxUser.SetGroups(newIterator(common.Map(user.Groups, func(g int) int32 { return int32(g) })))
+	}
+	session, err := w.iif.OpenShellSession(libboxUser, command, newIterator(environ), term, rows, cols)
+	if err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+func (w *platformInterfaceWrapper) LookupSFTPServer() (string, error) {
+	return w.iif.LookupSFTPServer()
+}
+
+func (w *platformInterfaceWrapper) ReadSystemSSHHostKey() ([]byte, error) {
+	result, err := w.iif.ReadSystemSSHHostKey()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(result), nil
+}
+
+func (w *platformInterfaceWrapper) TailscaleHostname() string {
+	return w.iif.TailscaleHostname()
+}
+
+func (w *platformInterfaceWrapper) UsePlatformBridge() bool {
+	return w.iif.UsePlatformBridge()
+}
+
+func (w *platformInterfaceWrapper) CreateBridge(options adapter.BridgeOptions) (adapter.BridgeSession, error) {
+	bridgeOptions := &BridgeOptions{
+		BridgeName: options.BridgeName,
+		MTU:        int32(options.MTU),
+		Interface:  options.Interface,
+		RuleIndex:  int32(options.RuleIndex),
+		RouteTable: int32(options.RouteTable),
+	}
+	if options.Inet4Port.IsValid() {
+		bridgeOptions.Inet4Port = options.Inet4Port.String()
+	}
+	if options.Inet6Port.IsValid() {
+		bridgeOptions.Inet6Port = options.Inet6Port.String()
+	}
+	session, err := w.iif.CreateBridge(bridgeOptions)
+	if err != nil {
+		return nil, err
+	}
+	return &bridgeSessionWrapper{session}, nil
+}
+
+type bridgeSessionWrapper struct {
+	session BridgeSession
+}
+
+func (w *bridgeSessionWrapper) FileDescriptor() int {
+	return int(w.session.FileDescriptor())
+}
+
+func (w *bridgeSessionWrapper) Name() string {
+	return w.session.Name()
+}
+
+func (w *bridgeSessionWrapper) Inet6Active() bool {
+	return w.session.Inet6Active()
+}
+
+func (w *bridgeSessionWrapper) SetEgress(interfaceName string) error {
+	return w.session.SetEgress(interfaceName)
+}
+
+func (w *bridgeSessionWrapper) Close() error {
+	return w.session.Close()
+}
+
+func (w *platformInterfaceWrapper) LookupUser(username string) (*adapter.PlatformUser, error) {
+	platformUser, err := w.iif.LookupUser(username)
+	if err != nil {
+		return nil, err
+	}
+	return &adapter.PlatformUser{
+		Username: platformUser.Username,
+		Uid:      int(platformUser.Uid),
+		Gid:      int(platformUser.Gid),
+		HomeDir:  platformUser.HomeDir,
+		Shell:    platformUser.Shell,
+		Groups:   common.Map(iteratorToArray[int32](platformUser.Groups()), func(g int32) int { return int(g) }),
+	}, nil
+}
+
+type neighborUpdateListenerWrapper struct {
+	listener adapter.NeighborUpdateListener
+}
+
+func (w *neighborUpdateListenerWrapper) UpdateNeighborTable(entries NeighborEntryIterator) {
+	var result []adapter.NeighborEntry
+	for entries.HasNext() {
+		entry := entries.Next()
+		if entry == nil {
+			continue
+		}
+		address, err := netip.ParseAddr(entry.Address)
+		if err != nil {
+			continue
+		}
+		macAddress, err := net.ParseMAC(entry.MacAddress)
+		if err != nil {
+			continue
+		}
+		result = append(result, adapter.NeighborEntry{
+			Address:    address,
+			MACAddress: macAddress,
+			Hostname:   entry.Hostname,
+		})
+	}
+	w.listener.UpdateNeighborTable(result)
+}
+
+func AvailablePort(startPort int32) (int32, error) {
+	for port := int(startPort); ; port++ {
+		if port > 65535 {
+			return 0, E.New("no available port found")
+		}
+		listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))))
+		if err != nil {
+			if errors.Is(err, syscall.EADDRINUSE) {
+				continue
+			}
+			return 0, E.Cause(err, "find available port")
+		}
+		err = listener.Close()
+		if err != nil {
+			return 0, E.Cause(err, "close listener")
+		}
+		return int32(port), nil
+	}
+}
+
+func RandomHex(length int32) *StringBox {
+	bytes := make([]byte, length)
+	common.Must1(rand.Read(bytes))
+	return wrapString(hex.EncodeToString(bytes))
 }

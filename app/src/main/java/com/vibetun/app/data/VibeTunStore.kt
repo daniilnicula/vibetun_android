@@ -57,6 +57,7 @@ class VibeTunStore(context: Context) {
         json.put(KEY_SELECTED_APPS_ONLY, preferences.getBoolean(KEY_SELECTED_APPS_ONLY, false))
         json.put(KEY_DIRECT_APPS, JSONArray(preferences.getStringSet(KEY_DIRECT_APPS, emptySet()).orEmpty().sorted()))
         json.put(KEY_ACTIVE_ROUTE_SET, preferences.getString(KEY_ACTIVE_ROUTE_SET, "").orEmpty())
+        json.put(KEY_TUN_MTU, preferences.getInt(KEY_TUN_MTU, SingBoxConfigBuilder.DEFAULT_TUN_MTU))
         writeFileJson(json)
     }
 
@@ -106,6 +107,52 @@ class VibeTunStore(context: Context) {
         writeFileJson(json)
     }
 
+    fun loadSubscriptions(): List<Subscription> {
+        migrateIfNeeded()
+        val raw = readFileJson().optString("subscriptions", "[]")
+        return runCatching {
+            val array = JSONArray(raw)
+            buildList {
+                for (index in 0 until array.length()) {
+                    val item = array.optJSONObject(index) ?: continue
+                    val url = item.optString("url")
+                    if (url.isBlank()) continue
+                    val ids = item.optJSONArray("profileIds")
+                    val profileIds = if (ids == null) emptyList() else {
+                        (0 until ids.length()).map { ids.optString(it) }.filter { it.isNotBlank() }
+                    }
+                    add(
+                        Subscription(
+                            id = item.optString("id").ifBlank { "sub-$index" },
+                            name = item.optString("name").ifBlank { subscriptionNameOf(url) },
+                            url = url,
+                            allowInsecure = item.optBoolean("allowInsecure", false),
+                            updatedAt = item.optLong("updatedAt", 0L),
+                            profileIds = profileIds,
+                        ),
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun saveSubscriptions(subscriptions: List<Subscription>) {
+        migrateIfNeeded()
+        val array = JSONArray()
+        subscriptions.forEach { subscription ->
+            array.put(
+                JSONObject()
+                    .put("id", subscription.id)
+                    .put("name", subscription.name)
+                    .put("url", subscription.url)
+                    .put("allowInsecure", subscription.allowInsecure)
+                    .put("updatedAt", subscription.updatedAt)
+                    .put("profileIds", JSONArray(subscription.profileIds)),
+            )
+        }
+        writeFileJson(readFileJson().put("subscriptions", array))
+    }
+
     var selectedProfileId: String
         get() {
             migrateIfNeeded()
@@ -144,6 +191,20 @@ class VibeTunStore(context: Context) {
         set(value) {
             migrateIfNeeded()
             writeFileJson(readFileJson().put(KEY_SELECTED_APPS_ONLY, value))
+        }
+
+    /** MTU Android TUN для sing-box; у AmneziaWG значение задаёт его собственный конфиг. */
+    var tunMtu: Int
+        get() {
+            migrateIfNeeded()
+            return readFileJson().optInt(KEY_TUN_MTU, SingBoxConfigBuilder.DEFAULT_TUN_MTU)
+                .takeIf { it in SingBoxConfigBuilder.MIN_TUN_MTU..SingBoxConfigBuilder.MAX_TUN_MTU }
+                ?: SingBoxConfigBuilder.DEFAULT_TUN_MTU
+        }
+        set(value) {
+            require(value in SingBoxConfigBuilder.MIN_TUN_MTU..SingBoxConfigBuilder.MAX_TUN_MTU)
+            migrateIfNeeded()
+            writeFileJson(readFileJson().put(KEY_TUN_MTU, value))
         }
 
     /** Цвет акцента приложения (ARGB); 0 — акцент по умолчанию для текущей темы. */
@@ -224,6 +285,7 @@ class VibeTunStore(context: Context) {
         private const val KEY_PROXY_WAS_ACTIVE = "proxy_was_active"
         private const val KEY_ACCENT_COLOR = "accent_color"
         private const val KEY_ACTIVE_ROUTE_SET = "active_route_set"
+        private const val KEY_TUN_MTU = "tun_mtu"
         private const val PROXY_WAS_ACTIVE_FILE = "proxy_was_active.txt"
     }
 }

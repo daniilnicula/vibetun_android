@@ -1,182 +1,340 @@
 package libbox
 
 import (
-	"encoding/binary"
+	"context"
 	"net"
 	"os"
 	"path/filepath"
-	"sync"
+	"strconv"
 
-	"github.com/sagernet/sing-box/common/urltest"
-	"github.com/sagernet/sing-box/experimental/clashapi"
+	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/daemon"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/service/oomkiller"
+	"github.com/sagernet/sing-box/service/powerreport"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/debug"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/observable"
-	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type CommandServer struct {
-	listener net.Listener
-	handler  CommandServerHandler
-
-	access     sync.Mutex
-	savedLines list.List[string]
-	maxLines   int
-	subscriber *observable.Subscriber[string]
-	observer   *observable.Observer[string]
-	service    *BoxService
-
-	// These channels only work with a single client. if multi-client support is needed, replace with Subscriber/Observer
-	urlTestUpdate chan struct{}
-	modeUpdate    chan struct{}
-	logReset      chan struct{}
+	*daemon.StartedService
+	ctx               context.Context
+	managedService    *daemon.ManagedService
+	handler           CommandServerHandler
+	platformInterface PlatformInterface
+	platformWrapper   *platformInterfaceWrapper
+	powerManager      *powerreport.Manager
+	oomRecorder       *oomkiller.Recorder
+	grpcServer        *grpc.Server
+	listener          net.Listener
 }
 
 type CommandServerHandler interface {
+	ServiceStop() error
 	ServiceReload() error
-	PostServiceClose()
-	GetSystemProxyStatus() *SystemProxyStatus
-	SetSystemProxyEnabled(isEnabled bool) error
+	GetSystemProxyStatus() (*SystemProxyStatus, error)
+	SetSystemProxyEnabled(enabled bool) error
+	TriggerNativeCrash() error
+	WriteDebugMessage(message string)
+	ConnectSSHAgent() (int32, error)
 }
 
-func NewCommandServer(handler CommandServerHandler, maxLines int32) *CommandServer {
+func NewCommandServer(handler CommandServerHandler, platformInterface PlatformInterface) (*CommandServer, error) {
+	ctx := baseContext(platformInterface)
+	powerManager := powerreport.NewManager()
+	service.MustRegister[*powerreport.Manager](ctx, powerManager)
+	platformWrapper := &platformInterfaceWrapper{
+		iif:          platformInterface,
+		powerManager: powerManager,
+	}
+	service.MustRegister[adapter.PlatformInterface](ctx, platformWrapper)
 	server := &CommandServer{
-		handler:       handler,
-		maxLines:      int(maxLines),
-		subscriber:    observable.NewSubscriber[string](128),
-		urlTestUpdate: make(chan struct{}, 1),
-		modeUpdate:    make(chan struct{}, 1),
-		logReset:      make(chan struct{}, 1),
+		ctx:               ctx,
+		handler:           handler,
+		platformInterface: platformInterface,
+		platformWrapper:   platformWrapper,
+		powerManager:      powerManager,
 	}
-	server.observer = observable.NewObserver[string](server.subscriber, 64)
-	return server
+	server.StartedService = daemon.NewStartedService(daemon.ServiceOptions{
+		Context: ctx,
+		// Platform:         platformWrapper,
+		Handler:           (*platformHandler)(server),
+		Debug:             sDebug,
+		LogMaxLines:       sLogMaxLines,
+		OOMKillerEnabled:  sOOMKillerEnabled,
+		OOMKillerDisabled: sOOMKillerDisabled,
+		OOMMemoryLimit:    uint64(sOOMMemoryLimit),
+		// WorkingDirectory: sWorkingPath,
+		// TempDirectory:    sTempPath,
+		// UserID:           sUserID,
+		// GroupID:          sGroupID,
+		// SystemProxyEnabled: false,
+	})
+	oomRecorder := oomkiller.NewRecorder(OOMRecorderOptions(server.StartedService))
+	service.MustRegister[*oomkiller.Recorder](ctx, oomRecorder)
+	oomRecorder.Start()
+	server.oomRecorder = oomRecorder
+	server.managedService = daemon.NewManagedService(daemon.ManagedServiceOptions{
+		Handler:     (*platformHandler)(server),
+		Debug:       sDebug,
+		OOMRecorder: oomRecorder,
+	})
+	if sPowerReportEnabled {
+		err := powerManager.Start(PowerReportOptions(server.StartedService))
+		if err != nil {
+			log.StdLogger().Error(E.Cause(err, "start power report recorder"))
+		}
+	}
+	return server, nil
 }
 
-func (s *CommandServer) SetService(newService *BoxService) {
-	if newService != nil {
-		service.PtrFromContext[urltest.HistoryStorage](newService.ctx).SetHook(s.urlTestUpdate)
-		newService.instance.Router().ClashServer().(*clashapi.Server).SetModeUpdateHook(s.modeUpdate)
+func unaryAuthInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	if sCommandServerSecret == "" {
+		return handler(ctx, req)
 	}
-	s.service = newService
-	s.notifyURLTestUpdate()
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, status.Error(codes.Unauthenticated, "missing metadata")
+	}
+	values := md.Get("x-command-secret")
+	if len(values) == 0 {
+		return nil, status.Error(codes.Unauthenticated, "missing authentication secret")
+	}
+	if values[0] != sCommandServerSecret {
+		return nil, status.Error(codes.Unauthenticated, "invalid authentication secret")
+	}
+	return handler(ctx, req)
 }
 
-func (s *CommandServer) ResetLog() {
-	s.savedLines.Init()
-	select {
-	case s.logReset <- struct{}{}:
-	default:
+func streamAuthInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	if sCommandServerSecret == "" {
+		return handler(srv, ss)
 	}
-}
-
-func (s *CommandServer) notifyURLTestUpdate() {
-	select {
-	case s.urlTestUpdate <- struct{}{}:
-	default:
+	md, ok := metadata.FromIncomingContext(ss.Context())
+	if !ok {
+		return status.Error(codes.Unauthenticated, "missing metadata")
 	}
+	values := md.Get("x-command-secret")
+	if len(values) == 0 {
+		return status.Error(codes.Unauthenticated, "missing authentication secret")
+	}
+	if values[0] != sCommandServerSecret {
+		return status.Error(codes.Unauthenticated, "invalid authentication secret")
+	}
+	return handler(srv, ss)
 }
 
 func (s *CommandServer) Start() error {
-	if !sTVOS {
-		return s.listenUNIX()
+	var (
+		listener net.Listener
+		err      error
+	)
+	if sCommandServerListenPort == 0 {
+		sockPath := filepath.Join(sBasePath, "command.sock")
+		os.Remove(sockPath)
+		listener, err = net.ListenUnix("unix", &net.UnixAddr{
+			Name: sockPath,
+			Net:  "unix",
+		})
+		if err != nil {
+			return E.Cause(err, "listen command server")
+		}
+		if sUserID != os.Getuid() {
+			err = os.Chown(sockPath, sUserID, sGroupID)
+			if err != nil {
+				listener.Close()
+				os.Remove(sockPath)
+				return E.Cause(err, "chown")
+			}
+		}
 	} else {
-		return s.listenTCP()
+		listener, err = net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(sCommandServerListenPort))))
+		if err != nil {
+			return E.Cause(err, "listen command server")
+		}
 	}
+	s.listener = listener
+	serverOptions := []grpc.ServerOption{
+		grpc.ChainUnaryInterceptor(unaryAuthInterceptor, daemon.UnaryLocaleInterceptor),
+		grpc.ChainStreamInterceptor(streamAuthInterceptor, daemon.StreamLocaleInterceptor),
+	}
+	s.grpcServer = grpc.NewServer(serverOptions...)
+	daemon.RegisterStartedServiceServer(s.grpcServer, s.StartedService)
+	daemon.RegisterManagedServiceServer(s.grpcServer, s.managedService)
+	healthServer := health.NewServer()
+	healthServer.SetServingStatus(daemon.StartedService_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	healthServer.SetServingStatus(daemon.ManagedService_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	grpc_health_v1.RegisterHealthServer(s.grpcServer, healthServer)
+	go s.grpcServer.Serve(listener)
+	return nil
 }
 
-func (s *CommandServer) listenUNIX() error {
-	sockPath := filepath.Join(sBasePath, "command.sock")
-	os.Remove(sockPath)
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{
-		Name: sockPath,
-		Net:  "unix",
+func (s *CommandServer) Close() {
+	if s.grpcServer != nil {
+		s.grpcServer.Stop()
+	}
+	common.Close(s.listener)
+	s.StartedService.Close()
+	s.oomRecorder.Close()
+	s.powerManager.Close()
+}
+
+type OverrideOptions struct {
+	AutoRedirect   bool
+	IncludePackage StringIterator
+	ExcludePackage StringIterator
+}
+
+func (s *CommandServer) StartOrReloadService(configContent string, options *OverrideOptions) error {
+	saveConfigSnapshot(configContent)
+	if s.powerManager.Recorder() != nil {
+		copyConfigSnapshot(filepath.Join(sWorkingPath, powerreport.DraftDirectoryName))
+	}
+	err := s.StartedService.StartOrReloadService(s.ctx, configContent, &daemon.OverrideOptions{
+		AutoRedirect:   options.AutoRedirect,
+		IncludePackage: iteratorToArray(options.IncludePackage),
+		ExcludePackage: iteratorToArray(options.ExcludePackage),
 	})
 	if err != nil {
-		return E.Cause(err, "listen ", sockPath)
+		return E.Cause(err, "start or reload service")
 	}
-	err = os.Chown(sockPath, sUserID, sGroupID)
-	if err != nil {
-		listener.Close()
-		os.Remove(sockPath)
-		return E.Cause(err, "chown")
-	}
-	s.listener = listener
-	go s.loopConnection(listener)
 	return nil
 }
 
-func (s *CommandServer) listenTCP() error {
-	listener, err := net.Listen("tcp", "127.0.0.1:8964")
+func (s *CommandServer) CloseService() error {
+	return s.StartedService.CloseService()
+}
+
+func (s *CommandServer) WriteMessage(level int32, message string) {
+	s.StartedService.WriteMessage(log.Level(level), message)
+}
+
+func (s *CommandServer) SetError(message string) {
+	s.StartedService.SetError(E.New(message))
+}
+
+func (s *CommandServer) NeedWIFIState() bool {
+	instance := s.StartedService.Instance()
+	if instance == nil || instance.Box() == nil {
+		return false
+	}
+	return instance.Box().Network().NeedWIFIState()
+}
+
+func (s *CommandServer) NeedFindProcess() bool {
+	instance := s.StartedService.Instance()
+	if instance == nil || instance.Box() == nil {
+		return false
+	}
+	return instance.Box().Router().NeedFindProcess()
+}
+
+// iOS wakes the extension for every push and background task, so wake is ignored there and
+// the pause ends on the screen state instead.
+func (s *CommandServer) Pause() {
+	recorder := s.powerManager.Recorder()
+	if recorder != nil {
+		recorder.RecordDeviceSleep()
+	}
+	if !(C.IsAndroid || C.IsIos) || C.IsTvOS {
+		return
+	}
+	instance := s.StartedService.Instance()
+	if instance == nil || instance.Box() == nil || instance.PauseManager() == nil {
+		return
+	}
+	instance.Box().CloseIdleConnections()
+	instance.PauseManager().DevicePause()
+}
+
+func (s *CommandServer) Wake() {
+	recorder := s.powerManager.Recorder()
+	if recorder != nil {
+		recorder.RecordDeviceWake()
+	}
+	if !C.IsAndroid {
+		return
+	}
+	instance := s.StartedService.Instance()
+	if instance == nil || instance.PauseManager() == nil {
+		return
+	}
+	instance.PauseManager().DeviceWake()
+}
+
+func (s *CommandServer) WakeNow() {
+	instance := s.StartedService.Instance()
+	if instance == nil || instance.PauseManager() == nil {
+		return
+	}
+	instance.PauseManager().DeviceWake()
+}
+
+func (s *CommandServer) RecordScreenState(on bool) {
+	recorder := s.powerManager.Recorder()
+	if recorder != nil {
+		recorder.RecordScreenState(on)
+	}
+}
+
+func (s *CommandServer) ResetNetwork() {
+	instance := s.StartedService.Instance()
+	if instance == nil || instance.Box() == nil {
+		return
+	}
+	instance.Box().Network().ResetNetwork(context.Background())
+}
+
+func (s *CommandServer) UpdateWIFIState() {
+	instance := s.StartedService.Instance()
+	if instance == nil || instance.Box() == nil {
+		return
+	}
+	instance.Box().Network().UpdateWIFIState(context.Background())
+}
+
+type platformHandler CommandServer
+
+func (h *platformHandler) ServiceStop() error {
+	return (*CommandServer)(h).handler.ServiceStop()
+}
+
+func (h *platformHandler) ServiceReload(ctx context.Context) error {
+	return (*CommandServer)(h).handler.ServiceReload()
+}
+
+func (h *platformHandler) SystemProxyStatus() (*daemon.SystemProxyStatus, error) {
+	status, err := (*CommandServer)(h).handler.GetSystemProxyStatus()
 	if err != nil {
-		return E.Cause(err, "listen")
+		return nil, E.Cause(err, "get system proxy status")
 	}
-	s.listener = listener
-	go s.loopConnection(listener)
-	return nil
+	return &daemon.SystemProxyStatus{
+		Enabled:   status.Enabled,
+		Available: status.Available,
+	}, nil
 }
 
-func (s *CommandServer) Close() error {
-	return common.Close(
-		s.listener,
-		s.observer,
-	)
+func (h *platformHandler) SetSystemProxyEnabled(enabled bool) error {
+	return (*CommandServer)(h).handler.SetSystemProxyEnabled(enabled)
 }
 
-func (s *CommandServer) loopConnection(listener net.Listener) {
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		go func() {
-			hErr := s.handleConnection(conn)
-			if hErr != nil && !E.IsClosed(err) {
-				if debug.Enabled {
-					log.Warn("log-server: process connection: ", hErr)
-				}
-			}
-		}()
-	}
+func (h *platformHandler) TriggerNativeCrash() error {
+	return (*CommandServer)(h).handler.TriggerNativeCrash()
 }
 
-func (s *CommandServer) handleConnection(conn net.Conn) error {
-	defer conn.Close()
-	var command uint8
-	err := binary.Read(conn, binary.BigEndian, &command)
-	if err != nil {
-		return E.Cause(err, "read command")
-	}
-	switch int32(command) {
-	case CommandLog:
-		return s.handleLogConn(conn)
-	case CommandStatus:
-		return s.handleStatusConn(conn)
-	case CommandServiceReload:
-		return s.handleServiceReload(conn)
-	case CommandServiceClose:
-		return s.handleServiceClose(conn)
-	case CommandCloseConnections:
-		return s.handleCloseConnections(conn)
-	case CommandGroup:
-		return s.handleGroupConn(conn)
-	case CommandSelectOutbound:
-		return s.handleSelectOutbound(conn)
-	case CommandURLTest:
-		return s.handleURLTest(conn)
-	case CommandGroupExpand:
-		return s.handleSetGroupExpand(conn)
-	case CommandClashMode:
-		return s.handleModeConn(conn)
-	case CommandSetClashMode:
-		return s.handleSetClashMode(conn)
-	case CommandGetSystemProxyStatus:
-		return s.handleGetSystemProxyStatus(conn)
-	case CommandSetSystemProxyEnabled:
-		return s.handleSetSystemProxyEnabled(conn)
-	default:
-		return E.New("unknown command: ", command)
-	}
+func (h *platformHandler) WriteDebugMessage(message string) {
+	(*CommandServer)(h).handler.WriteDebugMessage(message)
+}
+
+func (h *platformHandler) ConnectSSHAgent() (int32, error) {
+	return (*CommandServer)(h).handler.ConnectSSHAgent()
 }

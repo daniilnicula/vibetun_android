@@ -1,4 +1,4 @@
-package boxmain
+package main
 
 import (
 	"io"
@@ -43,16 +43,17 @@ func geositeExport(category string) error {
 		outputFile   *os.File
 		outputWriter io.Writer
 	)
-	if commandGeositeExportOutput == "stdout" {
+	switch commandGeositeExportOutput {
+	case "stdout":
 		outputWriter = os.Stdout
-	} else if commandGeositeExportOutput == commandGeositeExportDefaultOutput {
+	case commandGeositeExportDefaultOutput:
 		outputFile, err = os.Create("geosite-" + category + ".json")
 		if err != nil {
 			return err
 		}
 		defer outputFile.Close()
 		outputWriter = outputFile
-	} else {
+	default:
 		outputFile, err = os.Create(commandGeositeExportOutput)
 		if err != nil {
 			return err
@@ -70,7 +71,7 @@ func geositeExport(category string) error {
 	headlessRule.DomainKeyword = defaultRule.DomainKeyword
 	headlessRule.DomainRegex = defaultRule.DomainRegex
 	var plainRuleSet option.PlainRuleSetCompat
-	plainRuleSet.Version = C.RuleSetVersion1
+	plainRuleSet.Version = C.RuleSetVersion2
 	plainRuleSet.Options.Rules = []option.HeadlessRule{
 		{
 			Type:           C.RuleTypeDefault,

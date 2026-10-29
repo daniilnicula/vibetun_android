@@ -1,4 +1,4 @@
-package boxmain
+package main
 
 import (
 	"github.com/sagernet/sing-box/log"
