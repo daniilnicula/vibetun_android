@@ -34,6 +34,8 @@ import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.SystemUpdateAlt
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Switch
@@ -61,6 +63,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
 import com.vibetun.app.data.AppLog
+import com.vibetun.app.data.NetworkPersona
 import com.vibetun.app.data.VibeTunViewModel
 import com.vibetun.app.service.NativeCoreStatus
 
@@ -268,6 +271,95 @@ fun SettingsPage(
                     )
                     TextButton(onClick = { viewModel.updateTunMtu(mtuInput.toIntOrNull() ?: 0) }) {
                         Text("Применить", color = p.accent)
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+        PanelCard(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(14.dp)) {
+                Caption("МАСКИРОВКА ЗАПРОСОВ")
+                Text(
+                    "Под кого маскироваться",
+                    color = p.text,
+                    fontSize = 12.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.padding(top = 10.dp),
+                )
+                var personaMenuOpen by remember { mutableStateOf(false) }
+                val personaLabel = when (viewModel.personaMode) {
+                    NetworkPersona.MODE_CHROME -> "Google Chrome"
+                    NetworkPersona.MODE_FIREFOX -> "Mozilla Firefox"
+                    NetworkPersona.MODE_EDGE -> "Microsoft Edge"
+                    NetworkPersona.MODE_APP -> "Без маскировки (VibeTun)"
+                    else -> "Авто"
+                }
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(Modifier.weight(1f)) {
+                        Row(
+                            Modifier
+                                .clip(RoundedCornerShape(9.dp))
+                                .background(p.input)
+                                .border(BorderStroke(1.dp, p.border), RoundedCornerShape(9.dp))
+                                .clickable { personaMenuOpen = true }
+                                .padding(horizontal = 11.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(personaLabel, color = p.text, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                            Icon(
+                                Icons.Outlined.Tune,
+                                contentDescription = null,
+                                tint = p.textMuted,
+                                modifier = Modifier.size(15.dp),
+                            )
+                        }
+                        DropdownMenu(expanded = personaMenuOpen, onDismissRequest = { personaMenuOpen = false }) {
+                            listOf(
+                                NetworkPersona.MODE_AUTO to "Авто",
+                                NetworkPersona.MODE_CHROME to "Google Chrome",
+                                NetworkPersona.MODE_FIREFOX to "Mozilla Firefox",
+                                NetworkPersona.MODE_EDGE to "Microsoft Edge",
+                                NetworkPersona.MODE_APP to "Без маскировки (VibeTun)",
+                            ).forEach { (mode, label) ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            if (mode == viewModel.personaMode) "✓ $label" else label,
+                                            fontSize = 12.sp,
+                                            color = if (mode == viewModel.personaMode) p.accent else p.text,
+                                        )
+                                    },
+                                    onClick = {
+                                        personaMenuOpen = false
+                                        viewModel.updatePersonaMode(mode)
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+                // метка пересчитывается после ручного обновления (personaStamp)
+                val personaAge = viewModel.personaStamp.let { viewModel.personaAgeText() }
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        if (personaAge.isNotBlank()) {
+                            Text(personaAge, color = p.textMuted, fontSize = 10.sp)
+                        }
+                    }
+                    if (viewModel.personaMode != NetworkPersona.MODE_APP) {
+                        TextButton(onClick = { viewModel.refreshPersona() }, enabled = !viewModel.personaBusy) {
+                            Text(
+                                if (viewModel.personaBusy) "Обновление…" else "Обновить сейчас",
+                                color = if (viewModel.personaBusy) p.textMuted else p.accent,
+                            )
+                        }
                     }
                 }
             }

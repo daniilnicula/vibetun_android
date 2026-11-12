@@ -90,12 +90,6 @@ fun RoutingPage(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Маршрутизация", color = p.text, fontSize = 22.sp, fontWeight = FontWeight.SemiBold)
-                Text(
-                    "Входящие подключения, TUN, правила для доменов/IP и прил.",
-                    color = p.textMuted,
-                    fontSize = 11.sp,
-                    modifier = Modifier.padding(top = 2.dp),
-                )
             }
             Box {
                 SquareIconButton(
@@ -308,7 +302,8 @@ fun RoutingPage(
             } else if (filteredApps.isEmpty()) {
                 Text("Приложения не найдены.", color = p.textMuted, fontSize = 11.sp, modifier = Modifier.padding(vertical = 12.dp))
             } else {
-                filteredApps.take(80).forEach { app ->
+                filteredApps.take(80).forEachIndexed { i, app ->
+                    if (i > 0) Spacer(Modifier.height(4.dp))
                     val route = when {
                         app.packageName in viewModel.directPackages -> "direct"
                         app.packageName in viewModel.selectedPackages -> "proxy"

@@ -79,6 +79,7 @@ object UpdateManager {
         connection.connectTimeout = CONNECT_TIMEOUT_MS
         connection.readTimeout = READ_TIMEOUT_MS
         connection.instanceFollowRedirects = true
+        connection.setRequestProperty("User-Agent", NetworkPersona.userAgent)
         try {
             val code = connection.responseCode
             if (code != HttpURLConnection.HTTP_OK) {
@@ -119,8 +120,8 @@ object UpdateManager {
         val connection = URL(url).openConnection() as HttpURLConnection
         connection.connectTimeout = CONNECT_TIMEOUT_MS
         connection.readTimeout = READ_TIMEOUT_MS
-        // GitHub API просит User-Agent.
-        connection.setRequestProperty("User-Agent", "VibeTun-Updater")
+        // GitHub API просит User-Agent — подставляем текущий сетевой облик.
+        connection.setRequestProperty("User-Agent", NetworkPersona.userAgent)
         return try {
             val code = connection.responseCode
             if (code != HttpURLConnection.HTTP_OK) throw IOException("Сервер вернул HTTP $code.")

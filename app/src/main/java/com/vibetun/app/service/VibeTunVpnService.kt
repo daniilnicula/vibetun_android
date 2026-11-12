@@ -50,7 +50,6 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface as JavaNetworkInterface
-import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
@@ -400,11 +399,12 @@ open class VibeTunVpnService : VpnService(), LibboxPlatformInterface {
     }
 
     /** sing-box-живость: HTTP-проба через сам туннель. UID VPN-приложения системой из
-     *  собственного VPN исключается (в логе sing-box ноль соединений от нашего пакета), поэтому
-     *  обычный HttpURLConnection шёл по ПРЯМОМУ каналу: оператор резал точку пробе, и живой
-     *  туннель ложно признавался мёртвым каждые ~90 с. Привязываем сокет к VPN-сети
-     *  (Network.bindSocket) — пакеты идут в TUN и дальше через прокси: это честная проверка
-     *  всей цепочки. N подряд неудачных проб = туннель мёртв. */
+     *  собственного VPN исключается, поэтому сокет берём из фабрики VPN-сети:
+     *  и DNS-резолв, и TCP идут в TUN и дальше через прокси — честная проверка всей цепочки.
+     *  Раньше IP резолвился по каналу оператора (getByName до bindSocket): там, где оператор
+     *  портит резолв проверочного хоста, проба не доходила до ядра и живой туннель ложно
+     *  признавался мёртвым каждые ~90 с. Хостов несколько: если первый недоступен через
+     *  сервер, пробуем следующий. N подряд неудачных проб = туннель мёртв. */
     private fun probeSingBoxTunnel() {
         if (probingTunnel) return
         val network = findVpnNetwork()
@@ -414,24 +414,29 @@ open class VibeTunVpnService : VpnService(), LibboxPlatformInterface {
         }
         probingTunnel = true
         Thread({
-            val ok = runCatching {
-                val target = InetAddress.getByName(TUNNEL_PROBE_HOST)
-                val socket = Socket()
-                try {
-                    network.bindSocket(socket)
-                    socket.connect(InetSocketAddress(target, 80), TUNNEL_PROBE_TIMEOUT_MS)
-                    socket.soTimeout = TUNNEL_PROBE_TIMEOUT_MS
-                    val out = socket.getOutputStream()
-                    out.write(
-                        "GET /generate_204 HTTP/1.1\r\nHost: $TUNNEL_PROBE_HOST\r\nConnection: close\r\n\r\n"
-                            .toByteArray(Charsets.US_ASCII),
-                    )
-                    out.flush()
-                    socket.getInputStream().bufferedReader().readLine().orEmpty().contains(" 204")
-                } finally {
-                    runCatching { socket.close() }
-                }
-            }.getOrDefault(false)
+            // Сокет берём из фабрики VPN-сети: DNS-резолв тоже идёт в TUN (в ядро),
+            // а не по каналу оператора. Иначе на сетях, где оператор портит/блокирует
+            // резолв проверочного хоста, проба не доходит до ядра и живой туннель
+            // ложно признаётся мёртвым (реальный трафик при этом идёт нормально).
+            var ok = false
+            for (host in TUNNEL_PROBE_HOSTS) {
+                ok = runCatching {
+                    val socket = network.socketFactory.createSocket(host, 80)
+                    try {
+                        socket.soTimeout = TUNNEL_PROBE_TIMEOUT_MS
+                        val out = socket.getOutputStream()
+                        out.write(
+                            ("GET /generate_204 HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n")
+                                .toByteArray(Charsets.US_ASCII),
+                        )
+                        out.flush()
+                        socket.getInputStream().bufferedReader().readLine().orEmpty().contains(" 204")
+                    } finally {
+                        runCatching { socket.close() }
+                    }
+                }.getOrDefault(false)
+                if (ok) break
+            }
             mainHandler.post {
                 probingTunnel = false
                 if (!isProxyActive() || stateStore.state != ConnectionState.RUNNING) return@post
@@ -1413,9 +1418,10 @@ open class VibeTunVpnService : VpnService(), LibboxPlatformInterface {
         /** Подряд неудачных HTTP-проб через sing-box-туннель до признания его мёртвым. */
         private const val TUNNEL_WATCHDOG_FAILURE_LIMIT = 3
 
-        /** HTTP-проба: лёгкий эндпоинт Cloudflare, ожидаем ровно 204. Имя хоста отдельно —
-         *  IP резолвится напрямую (системный DNS приложения), а сам сокет привязан к VPN-сети. */
-        private const val TUNNEL_PROBE_HOST = "cp.cloudflare.com"
+        /** HTTP-проба: лёгкие generate_204-эндпоинты, ожидаем ровно 204. Сокет из фабрики
+         *  VPN-сети — резолв имени тоже идёт в TUN (в ядро), а не по каналу оператора.
+         *  Несколько хостов подряд: если первый недоступен через сервер, пробуем следующий. */
+        private val TUNNEL_PROBE_HOSTS = listOf("cp.cloudflare.com", "www.gstatic.com", "captive.apple.com")
         private const val TUNNEL_PROBE_TIMEOUT_MS = 10_000
 
         /** Возраст последнего AWG-handshake, после которого туннель считаем пропавшим

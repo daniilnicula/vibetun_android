@@ -744,6 +744,40 @@ class VibeTunViewModel(application: Application) : AndroidViewModel(application)
         store.accentColorArgb = argb
     }
 
+    // ----------------------------------------------------------- сетевой облик (User-Agent)
+
+    var personaMode by mutableStateOf(store.personaMode)
+        private set
+    /** Метка пересчёта текста «Обновлён: …» — меняется после ручного обновления. */
+    var personaStamp by mutableStateOf(0)
+        private set
+    var personaBusy by mutableStateOf(false)
+        private set
+
+    fun personaAgeText(): String = NetworkPersona.ageText()
+
+    fun updatePersonaMode(mode: String) {
+        if (mode !in NetworkPersona.MODES || mode == personaMode) return
+        personaMode = mode
+        store.personaMode = mode
+        NetworkPersona.setMode(mode)
+        personaStamp++
+    }
+
+    /** Кнопка «Обновить сейчас»: синхронный запрос в сетевом потоке. */
+    fun refreshPersona() {
+        if (personaBusy || personaMode == NetworkPersona.MODE_APP) return
+        personaBusy = true
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = NetworkPersona.refreshNowBlocking()
+            withContext(Dispatchers.Main) {
+                personaBusy = false
+                personaStamp++
+                feedback = if (ok) "Сетевой облик обновлён." else "Не удалось обновить облик: нет сети или источники не отвечают."
+            }
+        }
+    }
+
     private fun persistProfiles() = store.saveProfiles(profiles.toList())
 
     private fun persistSubscriptions() = store.saveSubscriptions(subscriptions.toList())

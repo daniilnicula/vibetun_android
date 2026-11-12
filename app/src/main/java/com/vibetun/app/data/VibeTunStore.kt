@@ -212,6 +212,17 @@ class VibeTunStore(context: Context) {
         get() = preferences.getInt(KEY_ACCENT_COLOR, 0)
         set(value) { preferences.edit().putInt(KEY_ACCENT_COLOR, value).commit() }
 
+    /** Режим маскировки User-Agent: auto | chrome | firefox | edge | app. */
+    var personaMode: String
+        get() {
+            migrateIfNeeded()
+            return readFileJson().optString(KEY_PERSONA_MODE, NetworkPersona.MODE_AUTO)
+        }
+        set(value) {
+            migrateIfNeeded()
+            writeFileJson(readFileJson().put(KEY_PERSONA_MODE, value))
+        }
+
     var powerOnboardingComplete: Boolean
         get() = preferences.getBoolean(KEY_POWER_SETUP_COMPLETE, false)
         set(value) { preferences.edit().putBoolean(KEY_POWER_SETUP_COMPLETE, value).apply() }
@@ -286,6 +297,7 @@ class VibeTunStore(context: Context) {
         private const val KEY_ACCENT_COLOR = "accent_color"
         private const val KEY_ACTIVE_ROUTE_SET = "active_route_set"
         private const val KEY_TUN_MTU = "tun_mtu"
+        private const val KEY_PERSONA_MODE = "persona_mode"
         private const val PROXY_WAS_ACTIVE_FILE = "proxy_was_active.txt"
     }
 }

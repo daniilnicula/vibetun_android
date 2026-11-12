@@ -16,19 +16,23 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsFocusedAsState
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -89,7 +93,9 @@ fun SegmentedControl(
     }
 }
 
-/** Поле поиска в стиле Windows-версии. */
+/** Поле поиска в стиле Windows-версии. На BasicTextField: фиксированная высота 40 dp
+ *  (ровно как у квадратных кнопок рядом) с гарантированным вертикальным центрированием
+ *  текста — у OutlinedTextField с явной высотой текст уезжает вниз. */
 @Composable
 fun SearchField(
     value: String,
@@ -98,24 +104,37 @@ fun SearchField(
     modifier: Modifier = Modifier,
 ) {
     val p = LocalGorePalette.current
-    OutlinedTextField(
+    val interactionSource = remember { MutableInteractionSource() }
+    val focused by interactionSource.collectIsFocusedAsState()
+    val shape = RoundedCornerShape(11.dp)
+    BasicTextField(
         value = value,
         onValueChange = onValueChange,
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth().height(40.dp),
         singleLine = true,
-        leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null, tint = p.textMuted, modifier = Modifier.size(18.dp)) },
-        placeholder = { Text(placeholder, fontSize = 12.sp, color = p.textMuted) },
+        interactionSource = interactionSource,
         textStyle = MaterialTheme.typography.bodySmall.copy(color = p.text, fontSize = 13.sp),
-        shape = RoundedCornerShape(11.dp),
-        colors = OutlinedTextFieldDefaults.colors(
-            focusedTextColor = p.text,
-            unfocusedTextColor = p.text,
-            focusedBorderColor = p.accent,
-            unfocusedBorderColor = p.border,
-            focusedContainerColor = p.input,
-            unfocusedContainerColor = p.input,
-            cursorColor = p.accent,
-        ),
+        cursorBrush = SolidColor(p.accent),
+        decorationBox = { innerTextField ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(shape)
+                    .background(p.input)
+                    .border(BorderStroke(1.dp, if (focused) p.accent else p.border), shape)
+                    .padding(horizontal = 11.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(Icons.Outlined.Search, contentDescription = null, tint = p.textMuted, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Box(Modifier.weight(1f)) {
+                    if (value.isEmpty()) {
+                        Text(placeholder, fontSize = 12.sp, color = p.textMuted)
+                    }
+                    innerTextField()
+                }
+            }
+        },
     )
 }
 

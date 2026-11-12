@@ -28,7 +28,7 @@ object SubscriptionFetcher {
         connection.connectTimeout = CONNECT_TIMEOUT_MS
         connection.readTimeout = READ_TIMEOUT_MS
         connection.instanceFollowRedirects = true
-        connection.setRequestProperty("User-Agent", "v2rayNG/1.7.13")
+        connection.setRequestProperty("User-Agent", NetworkPersona.userAgent)
         if (connection is HttpsURLConnection && allowInsecure) {
             connection.sslSocketFactory = trustingSslContext().socketFactory
             connection.hostnameVerifier = HostnameVerifier { _, _ -> true }
